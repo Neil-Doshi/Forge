@@ -1,0 +1,28 @@
+{
+  "name": "html-forge",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build && npm run size",
+    "preview": "vite preview --host 127.0.0.1",
+    "test": "vitest run",
+    "size": "node scripts/bundle-size.mjs",
+    "fixtures": "node scripts/generate-fixtures.mjs"
+  },
+  "dependencies": {
+    "dompurify": "3.4.8",
+    "fflate": "0.8.2",
+    "grapesjs": "0.23.2",
+    "idb": "8.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.29",
+    "fake-indexeddb": "6.0.0",
+    "jsdom": "26.1.0",
+    "typescript": "5.8.3",
+    "vite": "6.4.3",
+    "vitest": "4.1.8"
+  }
+}

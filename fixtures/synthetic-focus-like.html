@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Synthetic Focus Command OS</title>
+    <link rel="stylesheet" href="https://example.invalid/focus.css">
+    <style>
+      :root {
+        --gemstone: #0f766e;
+        --focus-accent: #be185d;
+        --panel-bg: #ffffff;
+      }
+      @import url("https://example.invalid/fonts.css");
+      @font-face { font-family: FocusRemote; src: url("https://example.invalid/focus.woff2"); }
+      @keyframes wheelPulse { from { transform: scale(.98); } to { transform: scale(1); } }
+      @keyframes captureRise { from { opacity: 0; } to { opacity: 1; } }
+      .app-view { display: none; min-height: 400px; padding: 24px; background: var(--panel-bg); }
+      .app-view.active { display: block; animation: captureRise .2s ease; }
+      .card { border: 1px solid #dde4ee; border-radius: 8px; padding: 16px; background-image: url("https://example.invalid/card.png"); }
+      .topbar, .sidebar { display: flex; gap: 12px; }
+      #wheel-overlay, #capture-overlay { position: fixed; inset: 20px; background: white; }
+    </style>
+  </head>
+  <body>
+    <header class="topbar"><button onclick="switchView('dashboard')">Dashboard</button><button onclick="switchView('settings')">Settings</button></header>
+    <aside class="sidebar"><button data-target="agenda">Agenda</button><button data-target="capture">Capture</button></aside>
+    <section id="dashboard-view" class="app-view active" data-view="dashboard"><h1>Dashboard</h1><article class="card">Today overview</article></section>
+    <section id="agenda-view" class="app-view" data-view="agenda"><h1>Agenda</h1><button onclick="switchView('tasks')">Tasks</button></section>
+    <section id="tasks-view" class="app-view" data-view="tasks"><h1>Tasks</h1><button onclick="switchView('projects')">Projects</button></section>
+    <section id="projects-view" class="app-view" data-view="projects"><h1>Projects</h1><button onclick="switchView('notes')">Notes</button></section>
+    <section id="notes-view" class="app-view" data-view="notes"><h1>Notes</h1><button onclick="switchView('calendar')">Calendar</button></section>
+    <section id="calendar-view" class="app-view" data-view="calendar"><h1>Calendar</h1><button onclick="switchView('review')">Review</button></section>
+    <section id="review-view" class="app-view" data-view="review"><h1>Review</h1><button onclick="switchView('library')">Library</button></section>
+    <section id="library-view" class="app-view" data-view="library"><h1>Library</h1><button onclick="switchView('insights')">Insights</button></section>
+    <section id="insights-view" class="app-view" data-view="insights"><h1>Insights</h1><button onclick="switchView('archive')">Archive</button></section>
+    <section id="archive-view" class="app-view" data-view="archive"><h1>Archive</h1><button onclick="switchView('capture')">Capture</button></section>
+    <section id="capture-view" class="app-view" data-view="capture"><h1>Capture</h1><button onclick="openOverlay('capture-overlay')">Open capture</button></section>
+    <div id="wheel-overlay" role="dialog" aria-modal="true"><button>Close</button><h2>Wheel</h2></div>
+    <div id="capture-overlay" role="dialog" aria-modal="true"><button>Close</button><h2>Capture</h2></div>
+    <form action="https://example.invalid/submit"><input name="idea"><button>Submit</button></form>
+    <script>
+      function switchView(name) {
+        document.querySelectorAll('.app-view').forEach(view => view.classList.remove('active'));
+        document.getElementById(name + '-view').classList.add('active');
+      }
+      function openOverlay(id) {
+        document.getElementById(id).hidden = false;
+      }
+      switchView('dashboard');
+      switchView('settings');
+    </script>
+  </body>
+</html>

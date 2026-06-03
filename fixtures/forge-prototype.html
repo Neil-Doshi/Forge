@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Synthetic Forge Prototype</title>
+    <style>
+      :root { --brand: #0f766e; }
+      .view { min-height: 320px; padding: 24px; }
+      .hidden { display: none; }
+      @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    </style>
+  </head>
+  <body>
+    <section id="home-view" class="view" data-view="home">
+      <h1>Home</h1>
+      <button onclick="switchView('details')">Open details</button>
+    </section>
+    <section id="details-view" class="view hidden" data-view="details">
+      <h1>Details</h1>
+      <a href="#home">Back home</a>
+    </section>
+    <script>
+      function switchView(name) {
+        document.querySelectorAll('.view').forEach(view => view.classList.add('hidden'));
+        document.getElementById(name + '-view').classList.remove('hidden');
+      }
+    </script>
+  </body>
+</html>
