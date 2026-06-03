@@ -1,32 +1,36 @@
 # Forge
 
-Forge is a local-first prototype builder based on the Forge V15 spec and bug report.
+Forge is a browser-based prototype builder for quickly sketching local app screens, dashboard flows, and clickable static demos. It is intentionally small, static, and local-first: the repository contains the tool, not user project data.
 
-## Access
+## What It Does
 
-This project is intended to stay private while it is not ready for public release. The GitHub repository should be private. Do not enable public GitHub Pages unless you are ready for anyone with the URL to access it.
+- Build screens on a canvas with common UI components, blueprints, pages, layers, and templates.
+- Edit position, size, rotation, typography, fill, borders, shadows, opacity, and simple click actions.
+- Move, resize, align, distribute, group, reorder, duplicate, copy, paste, and preview elements.
+- Export editable project JSON, standalone prototype HTML, a current-page HTML file, or an uncompressed ZIP bundle.
+- Keep project state in browser storage so work stays local to the user’s browser environment.
 
-To run it locally:
+## Project Data
 
-```powershell
-cd C:\Users\NEILDOSHI\Programming\Forge
-python -m http.server 4173
-```
+Forge does not include any saved user prototypes in this repository. Browser autosave, clipboard state, imported JSON, uploaded image assets, and exported files remain local to the user’s browser or download folder unless the user intentionally commits or uploads them elsewhere.
 
-Then open `http://localhost:4173`.
+## Implementation
 
-## Scope Implemented
+The app is a static frontend:
 
-- Critical bug fixes for inspector tabs, arrow-key history, bottom toolbar tools, exported prototype CSS, and layer reorder layout.
-- Significant fixes for device selector sync, selected icon updates, asset history payloads, upload limits, and context-menu bounds.
-- Core editor additions: rotation, Shift aspect-ratio resize, distribute spacing, font family, shadows, persistent guides, clipboard persistence, Ctrl+P preview, Escape handling, and border controls.
-- UX cleanup: current page status, theme swatches, safer inline editor selection, Firefox scrollbar styling, and roadmap updates.
-- Export cleanup: one canonical HTML export path and a local uncompressed ZIP bundle.
+- `index.html` defines the shell and editor panels.
+- `styles.css` contains the layout, responsive behavior, and visual system.
+- `app.js` contains the editor state, rendering, history, import/export, QA, and interaction logic.
 
-## Security Notes
+No backend, database, login system, cloud save, analytics script, or third-party runtime dependency is included.
 
-- The app uses no server, no login, and no cloud save.
-- Client-side login is not used as the privacy boundary because it is not meaningful protection for a static site.
-- Project data from imports and autosave is treated as untrusted and normalized before render/export.
-- SVG image uploads are blocked, image uploads are capped at 1.5 MB, and undo history excludes base64 asset payloads.
-- `index.html` includes a static-site CSP suitable for the current split-file app.
+## Safety Notes
+
+- Imported project data is treated as untrusted and normalized before render/export.
+- SVG uploads are blocked, raster image uploads are capped at 1.5 MB, and asset payloads are excluded from undo history snapshots.
+- The exported prototype uses minimal CSS instead of copying Forge’s internal UI styles.
+- A Content Security Policy is included for the static app shell.
+
+## Status
+
+Forge is an early local-first prototype builder. It is useful for fast mockups and demos, but it is not a production design system, collaborative editor, or cloud project manager.
