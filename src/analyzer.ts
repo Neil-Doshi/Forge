@@ -80,11 +80,17 @@ function collectScreenCandidates(doc: Document, switchTargets: Set<string>): Scr
     candidates.set(element, { name: readableName(label), selector: selectorFor(element), element, score });
   });
 
-  const ranked = Array.from(candidates.values())
+  const rankedByConfidence = Array.from(candidates.values())
     .sort((a, b) => b.score - a.score)
     .filter((candidate, index, list) => {
       return !list.slice(0, index).some((prior) => prior.element.contains(candidate.element) && prior.score >= candidate.score + 2);
     });
+  const ranked = rankedByConfidence.sort((a, b) => {
+    const position = a.element.compareDocumentPosition(b.element);
+    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+    return 0;
+  });
 
   if (!ranked.length && doc.body) {
     ranked.push({ name: "Home", selector: "body", element: doc.body, score: 1 });

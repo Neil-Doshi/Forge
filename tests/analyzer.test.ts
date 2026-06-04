@@ -4,13 +4,14 @@ import { describe, expect, it } from "vitest";
 import { analyzeHtmlImport } from "../src/analyzer";
 
 const focusLike = readFileSync(join(process.cwd(), "fixtures", "synthetic-focus-like.html"), "utf8");
-const prototype = readFileSync(join(process.cwd(), "fixtures", "forge-prototype.html"), "utf8");
+const productSample = readFileSync(join(process.cwd(), "fixtures", "forge-import-sample.html"), "utf8");
 const largeProject = readFileSync(join(process.cwd(), "fixtures", "large-project.html"), "utf8");
 
 describe("analyzeHtmlImport", () => {
   it("recovers a simple Forge export without executing scripts", () => {
-    const result = analyzeHtmlImport(prototype, "forge-prototype.html", true);
+    const result = analyzeHtmlImport(productSample, "forge-import-sample.html", true);
     expect(result.project.pages.length).toBeGreaterThanOrEqual(2);
+    expect(result.project.pages[0].name).toBe("Home");
     expect(result.report.sanitization.quarantinedScripts.length).toBeGreaterThan(0);
     expect(result.project.connections.some((connection) => connection.targetName === "details")).toBe(true);
   });

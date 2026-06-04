@@ -1,923 +1,1333 @@
 import "./styles.css";
-import { unzipSync, strFromU8 } from "fflate";
+import { strFromU8, unzipSync } from "fflate";
 import { analyzeHtmlImport, type ImportAnalysisResult } from "./analyzer";
-import { createPrototypeHtml, createProjectJson, createImportReportMarkdown, exportAiHandoff, exportProjectPackage } from "./exporter";
-import { mountGrapesEditor, type EditorSnapshot, type MountedEditor, type SelectedComponentSnapshot } from "./editor";
+import { createProductHtml, createProjectJson, exportProjectPackage } from "./exporter";
 import { createBlankProject } from "./projectFactory";
 import { migrateProject } from "./migrations";
-import { suggestLibraryItems } from "./library";
-import { acquireProjectLock, type ProjectLockHandle } from "./locks";
 import {
-  deleteProject,
   getImportReport,
   getProject,
   getStorageStatus,
-  listDecisions,
   listLibraryItems,
   listProjects,
   putProject,
   requestPersistentStorage,
-  saveDecision,
   saveImportReport,
   saveLibraryItem,
   saveProject
 } from "./storage";
-import { PROJECT_SCHEMA_VERSION, type DecisionRecord, type HtmlForgeProject, type ImportReport, type LibraryItem, type RouteId } from "./types";
-import { cloneProject, createId, debounce, downloadBlob, escapeAttribute, escapeHtml, formatFileStamp, generatedScreenId, humanBytes, nowIso, slugify } from "./utils";
-import { UnifiedHistoryService } from "./history";
+import { PROJECT_SCHEMA_VERSION, type ForgeAsset, type ForgeConnection, type ForgePage, type HtmlForgeProject, type LibraryItem } from "./types";
+import { createId, downloadBlob, escapeAttribute, escapeHtml, formatFileStamp, generatedScreenId, humanBytes, nowIso, slugify } from "./utils";
 
 const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("HTML Forge root element is missing.");
 const root: HTMLDivElement = rootElement;
 
-const routes: Array<{ id: RouteId; label: string; shortcut: string }> = [
-  { id: "home", label: "Home", shortcut: "H" },
-  { id: "editor", label: "Editor", shortcut: "E" },
-  { id: "connections", label: "Connections", shortcut: "C" },
-  { id: "library", label: "Library", shortcut: "L" },
-  { id: "report", label: "Report", shortcut: "R" },
-  { id: "export", label: "Export", shortcut: "X" },
-  { id: "settings", label: "Settings", shortcut: "S" }
-];
+type PanelId = "pages" | "components" | "reuse" | "assets" | "themes" | "import";
+type InspectorTab = "design" | "layout" | "actions" | "canvas";
+type ToolId = "select" | "hand" | "text" | "frame";
+type ElementType = "frame" | "text" | "button" | "input" | "card" | "image" | "shape" | "html";
+type ThemeId = "forge" | "slate" | "light" | "terminal";
 
-const instanceId = createId("instance");
-const history = new UnifiedHistoryService();
-
-interface AppState {
-  route: RouteId;
-  projects: HtmlForgeProject[];
-  project?: HtmlForgeProject;
-  report?: ImportReport;
-  importDraft?: ImportAnalysisResult;
-  importSourceText: string;
-  importFileName: string;
-  importRetainSource: boolean;
-  importOpen: boolean;
-  previewOpen: boolean;
-  previewHtml: string;
-  library: LibraryItem[];
-  decisions: DecisionRecord[];
-  storageMessage: string;
-  storageUsage: string;
-  connectionFilter: "all" | "issues" | "mapped";
-  libraryFilter: "reusable" | "project" | "review";
-  editorTab: "screens" | "layers" | "insert" | "warnings";
-  inspectorTab: "content" | "style" | "layout" | "behavior" | "effects";
-  editorZoom: number;
-  editorLeftWidth: number;
-  editorRightWidth: number;
-  editorCanvasHeight: number;
-  focusCanvas: boolean;
-  activeEditorPageId?: string;
-  selectedComponent?: SelectedComponentSnapshot;
-  editorError?: string;
-  dirty: boolean;
-  saving: boolean;
-  saveError?: string;
-  lockMessage: string;
-  toast?: string;
+interface ForgeElement {
+  id: string;
+  type: ElementType;
+  name: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation: number;
+  text: string;
+  html: string;
+  fill: string;
+  color: string;
+  border: string;
+  borderWidth: number;
+  radius: number;
+  font: number;
+  fontFamily: string;
+  weight: number;
+  opacity: number;
+  shadow: string;
+  locked: boolean;
+  hidden: boolean;
+  action: "" | "page" | "toggle";
+  target: string;
+  assetId?: string;
+  assetData?: string;
+  z: number;
 }
 
-const state: AppState = {
-  route: "home",
-  projects: [],
+interface ForgeDesignPage {
+  id: string;
+  generatedId: string;
+  name: string;
+  slug: string;
+  width: number;
+  height: number;
+  background: string;
+  elements: ForgeElement[];
+}
+
+interface ForgeTemplate {
+  id: string;
+  name: string;
+  category: "component" | "imported" | "blueprint";
+  elements: ForgeElement[];
+}
+
+interface ForgeDesignModel {
+  version: 2;
+  theme: ThemeId;
+  currentPageId: string;
+  pages: ForgeDesignPage[];
+  templates: ForgeTemplate[];
+  zoom: number;
+  grid: boolean;
+  snap: boolean;
+  nextNumber: number;
+}
+
+interface DragState {
+  kind: "drag" | "resize" | "pan" | "create";
+  id?: string;
+  handle?: string;
+  startClientX: number;
+  startClientY: number;
+  startCanvasX: number;
+  startCanvasY: number;
+  startScrollX?: number;
+  startScrollY?: number;
+  originals: Array<{ id: string; x: number; y: number; w: number; h: number }>;
+  ratio?: number;
+}
+
+const MODEL_NOTE_KEY = "forgeEditorModel";
+const instanceId = createId("instance");
+const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
+
+const defaultFont = "Inter, Segoe UI, system-ui, sans-serif";
+const themes: Record<ThemeId, { label: string; bg: string; panel: string; canvas: string; text: string; accent: string; accent2: string; muted: string; line: string }> = {
+  forge: { label: "Forge", bg: "#07111f", panel: "#101b2b", canvas: "#ffffff", text: "#f8fafc", accent: "#f59e0b", accent2: "#22d3ee", muted: "#9fb0c5", line: "#26384f" },
+  slate: { label: "Slate", bg: "#111827", panel: "#1f2937", canvas: "#f8fafc", text: "#f9fafb", accent: "#38bdf8", accent2: "#a7f3d0", muted: "#cbd5e1", line: "#374151" },
+  light: { label: "Light", bg: "#edf2f7", panel: "#ffffff", canvas: "#ffffff", text: "#172033", accent: "#0f766e", accent2: "#2563eb", muted: "#637083", line: "#d7dee9" },
+  terminal: { label: "Terminal", bg: "#050807", panel: "#0c1511", canvas: "#07110c", text: "#d6ffe3", accent: "#22c55e", accent2: "#84cc16", muted: "#8fc9a4", line: "#1d3a2a" }
+};
+
+const elementDefaults: Record<ElementType, Omit<ForgeElement, "id" | "name" | "x" | "y" | "z">> = {
+  frame: {
+    type: "frame",
+    w: 360,
+    h: 240,
+    rotation: 0,
+    text: "",
+    html: "",
+    fill: "#f8fafc",
+    color: "#172033",
+    border: "#cbd5e1",
+    borderWidth: 1,
+    radius: 8,
+    font: 16,
+    fontFamily: defaultFont,
+    weight: 600,
+    opacity: 100,
+    shadow: "0 12px 34px rgba(15,23,42,.12)",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  text: {
+    type: "text",
+    w: 280,
+    h: 72,
+    rotation: 0,
+    text: "New text",
+    html: "",
+    fill: "transparent",
+    color: "#172033",
+    border: "transparent",
+    borderWidth: 0,
+    radius: 0,
+    font: 28,
+    fontFamily: defaultFont,
+    weight: 800,
+    opacity: 100,
+    shadow: "",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  button: {
+    type: "button",
+    w: 148,
+    h: 48,
+    rotation: 0,
+    text: "Button",
+    html: "",
+    fill: "#0f766e",
+    color: "#ffffff",
+    border: "#0f766e",
+    borderWidth: 1,
+    radius: 8,
+    font: 15,
+    fontFamily: defaultFont,
+    weight: 800,
+    opacity: 100,
+    shadow: "",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  input: {
+    type: "input",
+    w: 280,
+    h: 46,
+    rotation: 0,
+    text: "Input label",
+    html: "",
+    fill: "#ffffff",
+    color: "#344258",
+    border: "#cbd5e1",
+    borderWidth: 1,
+    radius: 8,
+    font: 14,
+    fontFamily: defaultFont,
+    weight: 600,
+    opacity: 100,
+    shadow: "",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  card: {
+    type: "card",
+    w: 320,
+    h: 190,
+    rotation: 0,
+    text: "Card title\nCard content",
+    html: "",
+    fill: "#ffffff",
+    color: "#172033",
+    border: "#d9e1eb",
+    borderWidth: 1,
+    radius: 10,
+    font: 16,
+    fontFamily: defaultFont,
+    weight: 700,
+    opacity: 100,
+    shadow: "0 12px 34px rgba(15,23,42,.12)",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  image: {
+    type: "image",
+    w: 280,
+    h: 180,
+    rotation: 0,
+    text: "Image",
+    html: "",
+    fill: "#e5e7eb",
+    color: "#475569",
+    border: "#cbd5e1",
+    borderWidth: 1,
+    radius: 8,
+    font: 14,
+    fontFamily: defaultFont,
+    weight: 700,
+    opacity: 100,
+    shadow: "",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  shape: {
+    type: "shape",
+    w: 120,
+    h: 120,
+    rotation: 0,
+    text: "",
+    html: "",
+    fill: "#f59e0b",
+    color: "#111827",
+    border: "#f59e0b",
+    borderWidth: 1,
+    radius: 999,
+    font: 14,
+    fontFamily: defaultFont,
+    weight: 700,
+    opacity: 100,
+    shadow: "",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  },
+  html: {
+    type: "html",
+    w: 420,
+    h: 220,
+    rotation: 0,
+    text: "",
+    html: "<p>Imported HTML</p>",
+    fill: "#ffffff",
+    color: "#172033",
+    border: "#d9e1eb",
+    borderWidth: 1,
+    radius: 8,
+    font: 15,
+    fontFamily: defaultFont,
+    weight: 500,
+    opacity: 100,
+    shadow: "0 12px 34px rgba(15,23,42,.10)",
+    locked: false,
+    hidden: false,
+    action: "",
+    target: ""
+  }
+};
+
+const iconPaths = {
+  add: '<path d="M12 5v14M5 12h14"/>',
+  pointer: '<path d="m5 3 10 14 1-7 6-1Z"/><path d="m13 13 4 5"/>',
+  hand: '<path d="M8 11V5a2 2 0 0 1 4 0v5"/><path d="M12 10V4a2 2 0 0 1 4 0v7"/><path d="M16 11V7a2 2 0 0 1 4 0v7c0 5-3 8-8 8h-1c-3 0-5-2-6-5l-1-4a2 2 0 1 1 4-1l1 3"/>',
+  text: '<path d="M5 6V4h14v2M12 4v16M9 20h6"/>',
+  frame: '<path d="M4 4h16v16H4z"/><path d="M8 8h8v8H8z"/>',
+  undo: '<path d="M9 7H4v5"/><path d="M4 12c2-4 8-6 12-3 3 2 4 6 2 9"/>',
+  redo: '<path d="M15 7h5v5"/><path d="M20 12c-2-4-8-6-12-3-3 2-4 6-2 9"/>',
+  zoomIn: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M10.5 7.5v6M7.5 10.5h6M15.5 15.5 21 21"/>',
+  zoomOut: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M7.5 10.5h6M15.5 15.5 21 21"/>',
+  fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+  save: '<path d="M5 4h12l2 2v14H5z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/>',
+  preview: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="3"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3"/>',
+  pages: '<path d="M7 3h10l4 4v14H7z"/><path d="M17 3v5h5"/><path d="M3 7v14h4"/>',
+  components: '<path d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z"/>',
+  reuse: '<path d="M7 7h11v11H7z"/><path d="M4 14V4h10"/>',
+  image: '<path d="M4 5h16v14H4z"/><path d="m7 16 4-4 3 3 2-2 3 3"/><circle cx="9" cy="9" r="1.5"/>',
+  theme: '<path d="M12 3a9 9 0 0 0 0 18h1.5a2 2 0 0 0 0-4H12a2 2 0 0 1 0-4h4a5 5 0 0 0 0-10z"/><circle cx="8" cy="10" r="1"/><circle cx="11" cy="7" r="1"/><circle cx="15" cy="8" r="1"/>',
+  import: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
+  collapse: '<path d="m15 6-6 6 6 6"/>',
+  expand: '<path d="m9 6 6 6-6 6"/>',
+  layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>'
+} as const;
+
+function icon(name: keyof typeof iconPaths): string {
+  return `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${iconPaths[name]}</svg>`;
+}
+
+const app = {
+  projects: [] as HtmlForgeProject[],
+  library: [] as LibraryItem[],
+  project: undefined as HtmlForgeProject | undefined,
+  model: undefined as ForgeDesignModel | undefined,
+  activePanel: "components" as PanelId,
+  inspectorTab: "design" as InspectorTab,
+  activeTool: "select" as ToolId,
+  selectedIds: [] as string[],
+  leftCollapsed: false,
+  rightCollapsed: false,
+  topCollapsed: false,
+  previewOpen: false,
+  previewHtml: "",
+  importOpen: false,
   importSourceText: "",
   importFileName: "import.html",
   importRetainSource: true,
-  importOpen: false,
-  previewOpen: false,
-  previewHtml: "",
-  library: [],
-  decisions: [],
-  storageMessage: "Checking storage...",
+  importDraft: undefined as ImportAnalysisResult | undefined,
   storageUsage: "",
-  connectionFilter: "all",
-  libraryFilter: "reusable",
-  editorTab: "screens",
-  inspectorTab: "content",
-  editorZoom: 90,
-  editorLeftWidth: 248,
-  editorRightWidth: 280,
-  editorCanvasHeight: 720,
-  focusCanvas: false,
+  storageMessage: "Checking storage...",
   dirty: false,
   saving: false,
-  lockMessage: "No project lock active."
+  saveError: "",
+  toast: "",
+  drag: undefined as DragState | undefined,
+  history: [] as ForgeDesignModel[],
+  redo: [] as ForgeDesignModel[]
 };
 
-let mountedEditor: MountedEditor | undefined;
-let mountedEditorProjectId: string | undefined;
-let mountedEditorSnapshotKey = "";
-let editorMountToken = 0;
-let activeLock: ProjectLockHandle | undefined;
+function activePage(): ForgeDesignPage | undefined {
+  return app.model?.pages.find((page) => page.id === app.model?.currentPageId) ?? app.model?.pages[0];
+}
 
-function icon(
-  name: "undo" | "redo" | "zoomIn" | "zoomOut" | "fit" | "save" | "preview" | "focus" | "trash" | "pages" | "toolbox" | "connections" | "inspector"
-): string {
-  const paths: Record<typeof name, string> = {
-    undo: '<path d="M9 7H4v5"/><path d="M4 12c2.2-4.4 8.5-6.2 13-2.7 2.8 2.2 3.7 6 2 9"/>',
-    redo: '<path d="M15 7h5v5"/><path d="M20 12c-2.2-4.4-8.5-6.2-13-2.7-2.8 2.2-3.7 6-2 9"/>',
-    zoomIn: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M10.5 7.5v6M7.5 10.5h6M15.5 15.5 21 21"/>',
-    zoomOut: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M7.5 10.5h6M15.5 15.5 21 21"/>',
-    fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/><path d="M9 4 4 9M15 4l5 5M9 20l-5-5M15 20l5-5"/>',
-    save: '<path d="M5 4h12l2 2v14H5z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/>',
-    preview: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="3"/>',
-    focus: '<path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/>',
-    trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3"/>',
-    pages: '<path d="M7 3h10l4 4v14H7z"/><path d="M17 3v5h5"/><path d="M3 7v14h4"/>',
-    toolbox: '<path d="M4 7h16v12H4z"/><path d="M8 7V5h8v2M4 12h16"/><path d="M12 12v3"/>',
-    connections: '<circle cx="6" cy="7" r="3"/><circle cx="18" cy="17" r="3"/><path d="M8.5 9.5 15.5 14.5"/>',
-    inspector: '<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>'
+function selectedElements(): ForgeElement[] {
+  const page = activePage();
+  if (!page) return [];
+  return app.selectedIds.map((id) => page.elements.find((element) => element.id === id)).filter(Boolean) as ForgeElement[];
+}
+
+function selectedElement(): ForgeElement | undefined {
+  return selectedElements()[0];
+}
+
+function cloneModel(model: ForgeDesignModel): ForgeDesignModel {
+  return structuredClone(model);
+}
+
+function snap(value: number): number {
+  if (!app.model?.snap) return Math.round(value);
+  return Math.round(value / 10) * 10;
+}
+
+function nextZ(page: ForgeDesignPage): number {
+  return page.elements.reduce((max, element) => Math.max(max, element.z), 0) + 1;
+}
+
+function makeElement(type: ElementType, x = 80, y = 80, overrides: Partial<ForgeElement> = {}): ForgeElement {
+  const number = app.model?.nextNumber ?? 1;
+  if (app.model) app.model.nextNumber = number + 1;
+  const base = elementDefaults[type];
+  return {
+    ...structuredClone(base),
+    id: createId("el"),
+    name: `${type} ${number}`,
+    x,
+    y,
+    z: 1,
+    ...overrides
   };
-  return `<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]}</svg>`;
 }
 
-function setToast(message: string): void {
-  state.toast = message;
-  render();
-  window.setTimeout(() => {
-    if (state.toast === message) {
-      state.toast = undefined;
-      render();
+function textFromHtml(html: string): string {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return (doc.body.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+
+function elementsFromHtml(html: string, css = ""): ForgeElement[] {
+  const doc = new DOMParser().parseFromString(`<main>${html}</main>`, "text/html");
+  const candidates = Array.from(doc.body.querySelectorAll<HTMLElement>("h1,h2,h3,h4,p,button,a,input,textarea,label,img,article,section,div"));
+  const elements: ForgeElement[] = [];
+  let y = 64;
+  let z = 1;
+  candidates.slice(0, 42).forEach((node) => {
+    const tag = node.tagName.toLowerCase();
+    const text = (node.textContent ?? node.getAttribute("placeholder") ?? node.getAttribute("aria-label") ?? "").replace(/\s+/g, " ").trim();
+    if (!text && !["img", "input", "textarea", "section", "article", "div"].includes(tag)) return;
+    const style = node.getAttribute("style") ?? "";
+    const color = style.match(/color\s*:\s*([^;]+)/i)?.[1]?.trim();
+    const fill = style.match(/background(?:-color)?\s*:\s*([^;]+)/i)?.[1]?.trim();
+    const radius = Number(style.match(/border-radius\s*:\s*(\d+)/i)?.[1] ?? 8);
+    if (tag === "button" || tag === "a") {
+      elements.push(makeElement("button", 80, y, { text: text || "Button", z: z++, fill: fill ?? "#0f766e", color: color ?? "#ffffff", radius }));
+      y += 66;
+      return;
     }
-  }, 3200);
+    if (tag === "input" || tag === "textarea" || tag === "label") {
+      elements.push(makeElement("input", 80, y, { text: text || node.getAttribute("placeholder") || "Input", z: z++ }));
+      y += 66;
+      return;
+    }
+    if (tag === "img") {
+      elements.push(makeElement("image", 80, y, { text: node.getAttribute("alt") || "Image", z: z++ }));
+      y += 210;
+      return;
+    }
+    if (["article", "section", "div"].includes(tag) && text.length > 120) {
+      elements.push(makeElement("card", 80, y, { text: text.slice(0, 180), z: z++, fill: fill ?? "#ffffff", color: color ?? "#172033", radius }));
+      y += 220;
+      return;
+    }
+    const isHeading = /^h[1-4]$/.test(tag);
+    elements.push(
+      makeElement("text", 80, y, {
+        text: text || "Text",
+        z: z++,
+        w: isHeading ? 680 : 560,
+        h: isHeading ? 72 : 92,
+        font: isHeading ? 34 : 17,
+        weight: isHeading ? 900 : 500,
+        color: color ?? "#172033"
+      })
+    );
+    y += isHeading ? 86 : 106;
+  });
+  if (!elements.length) {
+    elements.push(makeElement("html", 70, 70, { html: css ? `<style>${css}</style>${html}` : html, text: textFromHtml(html).slice(0, 80), w: 760, h: 460, z: 1 }));
+  }
+  return elements.map((element, index) => ({ ...element, z: index + 1 }));
 }
 
-function editorSnapshotKey(snapshot: EditorSnapshot): string {
-  return JSON.stringify(snapshot.pages.map((page) => ({ id: page.id, name: page.name, html: page.html, css: page.css })));
+function modelFromProject(project: HtmlForgeProject): ForgeDesignModel {
+  const stored = project.notes?.[MODEL_NOTE_KEY];
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored) as ForgeDesignModel;
+      if (parsed.version === 2 && Array.isArray(parsed.pages)) return parsed;
+    } catch {
+      // Fall through and rebuild from project pages.
+    }
+  }
+  const pages: ForgeDesignPage[] = project.pages.map((page, index) => ({
+    id: page.id,
+    generatedId: page.generatedId || generatedScreenId(index),
+    name: page.name,
+    slug: page.slug || slugify(page.name),
+    width: 1200,
+    height: 800,
+    background: "#ffffff",
+    elements: elementsFromHtml(page.html, page.css)
+  }));
+  return {
+    version: 2,
+    theme: "forge",
+    currentPageId: pages[0]?.id ?? createId("page"),
+    pages: pages.length
+      ? pages
+      : [
+          {
+            id: createId("page"),
+            generatedId: generatedScreenId(0),
+            name: "Home",
+            slug: "home",
+            width: 1200,
+            height: 800,
+            background: "#ffffff",
+            elements: [makeElement("text", 80, 80, { text: "New UI", font: 48, w: 560, h: 90, z: 1 })]
+          }
+        ],
+    templates: [],
+    zoom: 100,
+    grid: true,
+    snap: true,
+    nextNumber: 20
+  };
 }
 
-function syncProjectFromEditorSnapshot(snapshot: EditorSnapshot): void {
-  if (!state.project) return;
-  state.project.grapesProjectData = snapshot.grapesProjectData;
-  snapshot.pages.forEach((pageSnapshot, index) => {
-    const page = state.project?.pages[index];
-    if (!state.project || !page) return;
-    page.html = pageSnapshot.html;
-    page.css = pageSnapshot.css;
-    page.modifiedAt = nowIso();
+function modelFromImport(result: ImportAnalysisResult): ForgeDesignModel {
+  const report = result.report;
+  const screens = report.screens.length
+    ? report.screens
+    : [
+        {
+          id: createId("screen"),
+          name: "Imported Screen",
+          selector: "body",
+          html: report.sanitizedHtml,
+          css: report.sanitizedCss,
+          componentCount: report.stats.componentCount
+        }
+      ];
+  const pages: ForgeDesignPage[] = screens.map((screen, index) => ({
+    id: result.project.pages[index]?.id ?? createId("page"),
+    generatedId: generatedScreenId(index),
+    name: screen.name || `Screen ${index + 1}`,
+    slug: slugify(screen.name || `screen-${index + 1}`),
+    width: 1200,
+    height: 800,
+    background: "#ffffff",
+    elements: elementsFromHtml(screen.html, screen.css)
+  }));
+  const templates = importedTemplates(report.sanitizedHtml);
+  const model: ForgeDesignModel = {
+    version: 2,
+    theme: "forge",
+    currentPageId: pages[0].id,
+    pages,
+    templates,
+    zoom: 100,
+    grid: true,
+    snap: true,
+    nextNumber: 100
+  };
+  wireImportedActions(model, result);
+  return model;
+}
+
+function importedTemplates(html: string): ForgeTemplate[] {
+  const doc = new DOMParser().parseFromString(`<main>${html}</main>`, "text/html");
+  const templates: ForgeTemplate[] = [];
+  Array.from(doc.body.querySelectorAll<HTMLElement>("header,nav,article,section,form,button")).slice(0, 12).forEach((node, index) => {
+    const text = (node.textContent ?? node.getAttribute("aria-label") ?? node.tagName).replace(/\s+/g, " ").trim();
+    const type: ElementType = node.tagName.toLowerCase() === "button" ? "button" : node.tagName.toLowerCase() === "form" ? "card" : "html";
+    templates.push({
+      id: createId("tpl"),
+      name: text.slice(0, 34) || `Imported ${index + 1}`,
+      category: "imported",
+      elements: [makeElement(type, 80, 80, { html: node.outerHTML, text: text || "Imported component", w: type === "button" ? 148 : 460, h: type === "button" ? 48 : 220, z: 1 })]
+    });
+  });
+  return templates;
+}
+
+type ImportedInteraction = ImportAnalysisResult["report"]["interactions"][number];
+
+function normalizeActionName(value = ""): string {
+  return value.toLowerCase().replace(/[\s_-]+/g, " ").replace(/\b(view|screen|page|panel)\b/g, "").replace(/\s+/g, " ").trim();
+}
+
+function pageLookup(model: ForgeDesignModel): Map<string, string> {
+  const lookup = new Map<string, string>();
+  model.pages.forEach((page) => {
+    [page.name, page.slug, page.generatedId, page.slug.replace(/-(view|screen|page|panel)$/i, "")].forEach((value) => {
+      const normalized = normalizeActionName(value);
+      if (normalized) lookup.set(normalized, page.id);
+    });
+  });
+  return lookup;
+}
+
+function elementActionText(element: ForgeElement): string {
+  return normalizeActionName(element.text || textFromHtml(element.html) || element.name);
+}
+
+function importedActionScore(page: ForgeDesignPage, element: ForgeElement, interaction: ImportedInteraction, targetName: string, targetId: string): number {
+  if (!["button", "text", "html"].includes(element.type) || element.action) return -1;
+  const text = elementActionText(element);
+  if (!text) return -1;
+  const source = normalizeActionName(interaction.sourceName);
+  const target = normalizeActionName(targetName);
+  let score = element.type === "button" ? 80 : element.type === "html" ? 40 : 20;
+  if (source && text === source) score += 90;
+  if (source && (text.includes(source) || source.includes(text))) score += 42;
+  if (target && text === target) score += 26;
+  if (target && text.includes(target)) score += 38;
+  if (interaction.type === "switchView" && /\b(open|go|view|show|details|next)\b/.test(text)) score += 18;
+  if (page.id === targetId && text === target) score -= 60;
+  if (page.id === targetId && interaction.type === "switchView") score -= 35;
+  return score;
+}
+
+function wireImportedActions(model: ForgeDesignModel, result: ImportAnalysisResult): void {
+  const byName = pageLookup(model);
+  result.report.interactions
+    .filter((interaction) => interaction.status !== "unsupported" && interaction.targetName)
+    .forEach((interaction) => {
+      const targetName = interaction.targetName as string;
+      const targetId = byName.get(normalizeActionName(targetName));
+      if (!targetId) return;
+      let best: { page: ForgeDesignPage; element: ForgeElement; score: number } | undefined;
+      for (const page of model.pages) {
+        for (const element of page.elements) {
+          const score = importedActionScore(page, element, interaction, targetName, targetId);
+          if (score < 55) continue;
+          if (!best || score > best.score) best = { page, element, score };
+        }
+      }
+      if (best) {
+        best.element.action = "page";
+        best.element.target = targetId;
+      }
+    });
+}
+
+function compileElementContent(element: ForgeElement, interactive = false): string {
+  if (element.type === "html") return element.html;
+  if (element.type === "image") {
+    const src = element.assetData || "";
+    return src ? `<img src="${escapeAttribute(src)}" alt="${escapeAttribute(element.text || element.name)}">` : `<span>${escapeHtml(element.text || "Image")}</span>`;
+  }
+  if (element.type === "input") return `<span>${escapeHtml(element.text)}</span>`;
+  if (element.type === "card") {
+    const [title, ...body] = element.text.split("\n");
+    return `<strong>${escapeHtml(title || "Card title")}</strong><span>${escapeHtml(body.join("\n") || "Card content")}</span>`;
+  }
+  if (interactive && element.type === "button") return `<button type="button">${escapeHtml(element.text)}</button>`;
+  return escapeHtml(element.text);
+}
+
+function elementStyle(element: ForgeElement): string {
+  const image = element.type === "image" && element.assetData ? `background-image:url(${element.assetData});background-size:cover;background-position:center;` : "";
+  const display = element.hidden ? "display:none;" : "";
+  return [
+    `position:absolute`,
+    `left:${element.x}px`,
+    `top:${element.y}px`,
+    `width:${element.w}px`,
+    `height:${element.h}px`,
+    `z-index:${element.z}`,
+    `transform:rotate(${element.rotation}deg)`,
+    `transform-origin:center center`,
+    `opacity:${element.opacity / 100}`,
+    `background:${element.fill}`,
+    image,
+    `color:${element.color}`,
+    `border:${element.borderWidth}px solid ${element.border}`,
+    `border-radius:${element.radius}px`,
+    `box-shadow:${element.shadow || "none"}`,
+    `font:${element.weight} ${element.font}px ${element.fontFamily}`,
+    display
+  ].join(";");
+}
+
+function compilePageHtml(page: ForgeDesignPage): string {
+  return `<div class="forge-product-canvas" style="position:relative;width:${page.width}px;height:${page.height}px;min-height:${page.height}px;background:${page.background};overflow:hidden">${page.elements
+    .filter((element) => !element.hidden)
+    .map((element) => {
+      const attrs = [
+        `class="forge-product-element forge-product-${element.type}"`,
+        `data-forge-id="${escapeAttribute(element.id)}"`,
+        `data-forge-name="${escapeAttribute(element.name)}"`,
+        element.action ? `data-forge-action="${escapeAttribute(element.action)}"` : "",
+        element.target ? `data-forge-target="${escapeAttribute(element.target)}"` : "",
+        `style="${escapeAttribute(elementStyle(element))}"`
+      ]
+        .filter(Boolean)
+        .join(" ");
+      return `<div ${attrs}>${compileElementContent(element, true)}</div>`;
+    })
+    .join("")}</div>`;
+}
+
+function compilePageCss(page: ForgeDesignPage): string {
+  return `
+.forge-product-canvas{font-family:${defaultFont};}
+.forge-product-element{box-sizing:border-box;display:flex;align-items:center;justify-content:center;white-space:pre-wrap;overflow:hidden;padding:8px;line-height:1.2}
+.forge-product-card{align-items:flex-start;flex-direction:column;gap:8px;text-align:left}
+.forge-product-image{padding:0}
+.forge-product-image img{width:100%;height:100%;object-fit:cover;display:block}
+.forge-product-button button{width:100%;height:100%;border:0;background:transparent;color:inherit;font:inherit;cursor:pointer}
+.forge-product-input::after{content:"";position:absolute;left:12px;right:12px;bottom:10px;height:1px;background:currentColor;opacity:.28}
+@media (max-width: ${page.width}px){.forge-product-canvas{max-width:100%;height:auto;min-height:${page.height}px}}
+`;
+}
+
+function syncProjectModel(): void {
+  if (!app.project || !app.model) return;
+  const now = nowIso();
+  app.project.name = app.project.name || "HTML Forge Project";
+  app.project.slug = slugify(app.project.name);
+  app.project.modifiedAt = now;
+  app.project.notes[MODEL_NOTE_KEY] = JSON.stringify(app.model);
+  app.project.pages = app.model.pages.map(
+    (page, index): ForgePage => ({
+      id: page.id,
+      generatedId: page.generatedId || generatedScreenId(index),
+      name: page.name,
+      slug: page.slug || slugify(page.name),
+      html: compilePageHtml(page),
+      css: compilePageCss(page),
+      notes: "",
+      componentCount: page.elements.length,
+      createdAt: now,
+      modifiedAt: now
+    })
+  );
+  app.project.connections = [];
+  app.model.pages.forEach((page) => {
+    page.elements
+      .filter((element) => element.action === "page" && element.target)
+      .forEach((element) => {
+        const target = app.model?.pages.find((candidate) => candidate.id === element.target || candidate.name === element.target);
+        if (!target) return;
+        app.project?.connections.push({
+          id: `connection-${element.id}`,
+          sourcePageId: page.id,
+          triggerLabel: element.text || element.name,
+          action: "navigate",
+          targetId: target.id,
+          targetName: target.name,
+          selector: `[data-forge-id="${element.id}"] button, [data-forge-id="${element.id}"]`,
+          status: "mapped",
+          createdAt: now,
+          modifiedAt: now
+        } satisfies ForgeConnection);
+      });
   });
 }
 
-function unmountEditor(): void {
-  editorMountToken += 1;
-  try {
-    if (mountedEditor && state.project) {
-      const snapshot = mountedEditor.saveSnapshot();
-      const key = editorSnapshotKey(snapshot);
-      if (key !== mountedEditorSnapshotKey) {
-        const before = cloneProject(state.project);
-        syncProjectFromEditorSnapshot(snapshot);
-        mountedEditorSnapshotKey = key;
-        markDirty("Visual editor change", before);
-      }
-    }
-    mountedEditor?.destroy();
-  } catch (error) {
-    console.warn("Editor teardown recovered", error);
-  }
-  mountedEditor = undefined;
-  mountedEditorProjectId = undefined;
-  mountedEditorSnapshotKey = "";
-  state.selectedComponent = undefined;
+function pushHistory(label = "edit"): void {
+  void label;
+  if (!app.model) return;
+  app.history.push(cloneModel(app.model));
+  if (app.history.length > 80) app.history.shift();
+  app.redo = [];
 }
 
-function statusLabel(): string {
-  if (!state.project) return "No project open";
-  if (state.saveError) return `Save issue: ${state.saveError}`;
-  if (state.saving) return "Saving locally...";
-  if (state.dirty) return "Unsaved local edits";
-  return `Saved locally, revision ${state.project.revision}`;
-}
-
-const scheduleSave = debounce(async () => {
-  if (!state.project) return;
-  try {
-    state.saving = true;
-    const expected = state.project.revision;
-    state.project = await saveProject(state.project, instanceId, expected);
-    state.projects = await listProjects();
-    state.dirty = false;
-    state.saveError = undefined;
-  } catch (error) {
-    state.saveError = error instanceof Error ? error.message : String(error);
-  } finally {
-    state.saving = false;
-    renderStatusOnly();
-  }
-}, 700);
-
-function markDirty(label: string, before?: HtmlForgeProject): void {
-  if (state.project && before) history.record(label, before, state.project);
-  state.dirty = true;
+function markDirty(renderAfter = false): void {
+  syncProjectModel();
+  app.dirty = true;
   scheduleSave();
-  renderStatusOnly();
+  updateStatusOnly();
+  if (renderAfter) render();
 }
 
-function renderStatusOnly(): void {
-  root.querySelector("[data-status-text]")?.replaceChildren(document.createTextNode(statusLabel()));
-  const save = root.querySelector("[data-save-state]");
-  if (save) save.textContent = state.saving ? "Saving" : state.dirty ? "Pending" : "Saved";
-}
+const scheduleSave = window.setTimeout
+  ? ((() => {
+      let timer = 0;
+      return () => {
+        window.clearTimeout(timer);
+        timer = window.setTimeout(() => void saveNow(false), 700);
+      };
+    })() as () => void)
+  : () => undefined;
 
-function routeMarkup(): string {
-  switch (state.route) {
-    case "home":
-      return homeView();
-    case "editor":
-      return editorView();
-    case "connections":
-      return connectionsView();
-    case "library":
-      return libraryView();
-    case "report":
-      return reportView();
-    case "export":
-      return exportView();
-    case "settings":
-      return settingsView();
+async function saveNow(showToast = true): Promise<void> {
+  if (!app.project) return;
+  syncProjectModel();
+  try {
+    app.saving = true;
+    updateStatusOnly();
+    app.project = await saveProject(app.project, instanceId, app.project.revision);
+    app.projects = await listProjects();
+    app.dirty = false;
+    app.saveError = "";
+    if (showToast) toast("Saved locally.");
+  } catch (error) {
+    app.saveError = error instanceof Error ? error.message : String(error);
+    toast("Save failed. Export a backup before closing.");
+  } finally {
+    app.saving = false;
+    updateStatusOnly();
   }
+}
+
+function statusText(): string {
+  if (app.saveError) return `Save issue: ${app.saveError}`;
+  if (app.saving) return "Saving locally...";
+  if (app.dirty) return "Unsaved local edits";
+  return "Saved locally";
+}
+
+function toast(message: string): void {
+  app.toast = message;
+  renderToast();
+  window.setTimeout(() => {
+    if (app.toast === message) {
+      app.toast = "";
+      renderToast();
+    }
+  }, 2600);
+}
+
+function renderToast(): void {
+  const node = document.querySelector<HTMLElement>("[data-toast]");
+  if (!node) return;
+  node.textContent = app.toast;
+  node.hidden = !app.toast;
+}
+
+function updateStatusOnly(): void {
+  document.querySelector("[data-save-state]")?.replaceChildren(document.createTextNode(statusText()));
+  document.querySelector("[data-element-count]")?.replaceChildren(document.createTextNode(`${activePage()?.elements.length ?? 0} elements`));
 }
 
 function render(): void {
-  unmountEditor();
+  const theme = themes[app.model?.theme ?? "forge"];
   root.innerHTML = `
-    <div class="app-shell">
-      <aside class="rail" aria-label="HTML Forge workspaces">
-        <div class="brand-block">
-          <div class="brand-mark" aria-hidden="true">HF</div>
-          <div>
-            <p class="eyebrow">Local-only app</p>
-            <h1>HTML Forge</h1>
-          </div>
-        </div>
-        <nav class="rail-nav">
-          ${routes
-            .map(
-              (route) =>
-                `<button type="button" class="rail-link ${state.route === route.id ? "is-active" : ""}" data-route="${route.id}" aria-current="${
-                  state.route === route.id ? "page" : "false"
-                }"><span aria-hidden="true">${route.shortcut}</span>${route.label}</button>`
-            )
-            .join("")}
-        </nav>
-        <div class="rail-footer">
-          <span class="lock-dot" aria-hidden="true"></span>
-          <span>${escapeHtml(activeLock?.state ?? "local")}</span>
-        </div>
-      </aside>
-      <main class="workspace">
-        <header class="project-header">
-          <div>
-            <p class="eyebrow">Projects stay in this browser unless exported</p>
-            <h2>${escapeHtml(state.project?.name ?? "HTML Forge")}</h2>
-          </div>
-          <div class="header-actions">
-            <span class="save-pill" data-save-state>${state.saving ? "Saving" : state.dirty ? "Pending" : "Saved"}</span>
-            <button type="button" class="secondary-button" data-action="open-import">Import HTML</button>
-            <button type="button" class="primary-button" data-action="new-project">New</button>
-          </div>
-        </header>
-        <div class="status-strip" role="status">
-          <span data-status-text>${escapeHtml(statusLabel())}</span>
-          <span>${escapeHtml(state.lockMessage)}</span>
-        </div>
-        ${routeMarkup()}
-      </main>
-      ${state.importOpen ? importStudio() : ""}
-      ${state.previewOpen ? previewDialog() : ""}
-      ${state.toast ? `<div class="toast" role="status">${escapeHtml(state.toast)}</div>` : ""}
+    <div class="forge-app ${app.leftCollapsed ? "left-collapsed" : ""} ${app.rightCollapsed ? "right-collapsed" : ""} ${app.topCollapsed ? "top-collapsed" : ""}" style="--app-bg:${theme.bg};--panel:${theme.panel};--canvas:${theme.canvas};--text:${theme.text};--accent:${theme.accent};--accent-2:${theme.accent2};--muted:${theme.muted};--line:${theme.line}">
+      ${topbarMarkup()}
+      ${leftPanelMarkup()}
+      ${canvasMarkup()}
+      ${rightPanelMarkup()}
+      ${statusbarMarkup()}
+      ${app.importOpen ? importDialogMarkup() : ""}
+        ${app.previewOpen ? previewDialogMarkup() : ""}
+      <div class="toast" data-toast ${app.toast ? "" : "hidden"}>${escapeHtml(app.toast)}</div>
     </div>
   `;
   bindEvents();
-  if (state.route === "editor" && !state.editorError) void mountEditorIfNeeded();
 }
 
-function homeView(): string {
-  const projectRows = state.projects.length
-    ? state.projects
-        .map(
-          (project) => `
-            <article class="item-row">
-              <div>
-                <strong>${escapeHtml(project.name)}</strong>
-                <span>${escapeHtml(project.importSummary ?? `${project.pages.length} screen${project.pages.length === 1 ? "" : "s"}`)}</span>
-              </div>
-              <div class="row-actions">
-                <button type="button" class="secondary-button compact" data-open-project="${project.id}">Open</button>
-                <button type="button" class="ghost-button compact" data-duplicate-project="${project.id}">Duplicate</button>
-                <button type="button" class="ghost-button compact danger" data-delete-project="${project.id}">Delete</button>
-              </div>
-            </article>`
-        )
-        .join("")
-    : `<div class="empty-panel"><h3>No local projects yet</h3><p>Create a blank project or import an HTML file. Nothing is uploaded.</p></div>`;
-
+function topbarMarkup(): string {
+  const page = activePage();
   return `
-    <section class="home-grid">
-      <div class="intro-panel">
-        <p class="eyebrow">Ready to ship locally</p>
-        <h2>Import, repair, edit, and export safe HTML prototypes.</h2>
-        <p>HTML Forge analyzes untrusted source as inert text, shows sanitized previews in sandboxed frames, and saves editable projects in IndexedDB.</p>
-        <div class="button-row">
-          <button type="button" class="primary-button" data-action="open-import">Launch Import Studio</button>
-          <button type="button" class="secondary-button" data-action="new-project">Create blank project</button>
-          <label class="file-button">
-            Import project/package
-            <input type="file" accept=".json,.htmlforge.json,.zip,.htmlforge.zip,application/json,application/zip" data-action="import-project-file">
-          </label>
+    <header class="forge-topbar">
+      <div class="brand">
+        <div class="brand-mark">F</div>
+        <div class="brand-copy">
+          <strong>Forge</strong>
+          <span>${escapeHtml(page?.name ?? "No page")}</span>
         </div>
       </div>
-      <section class="workspace-panel">
-        <div class="panel-heading">
-          <h3>Recent Local Projects</h3>
-          <span>${state.projects.length}</span>
-        </div>
-        <div class="list-stack">${projectRows}</div>
-      </section>
-      <section class="workspace-panel">
-        <div class="panel-heading"><h3>Import Boundaries</h3><span>3 surfaces</span></div>
-        <div class="metric-grid">
-          <div><strong>Source analysis</strong><span>DOMParser only, no active render.</span></div>
-          <div><strong>Safe preview</strong><span><code>iframe sandbox=""</code></span></div>
-          <div><strong>Behavior preview</strong><span><code>allow-scripts</code>, no same-origin.</span></div>
-        </div>
-      </section>
-      <section class="workspace-panel">
-        <div class="panel-heading"><h3>Storage</h3><span>${escapeHtml(state.storageUsage)}</span></div>
-        <p>${escapeHtml(state.storageMessage)}</p>
-        <button type="button" class="secondary-button" data-action="persist-storage">Request persistent storage</button>
-      </section>
+      <div class="tool-strip" role="toolbar" aria-label="Editor toolbar">
+        <button class="icon-button ${app.activeTool === "select" ? "is-active" : ""}" title="Select tool" aria-label="Select tool" data-tool="select">${icon("pointer")}</button>
+        <button class="icon-button ${app.activeTool === "hand" ? "is-active" : ""}" title="Hand pan tool" aria-label="Hand pan tool" data-tool="hand">${icon("hand")}</button>
+        <button class="icon-button ${app.activeTool === "text" ? "is-active" : ""}" title="Text tool" aria-label="Text tool" data-tool="text">${icon("text")}</button>
+        <button class="icon-button ${app.activeTool === "frame" ? "is-active" : ""}" title="Frame tool" aria-label="Frame tool" data-tool="frame">${icon("frame")}</button>
+        <span class="toolbar-separator"></span>
+        ${quickAddButton("text", "Text")}
+        ${quickAddButton("button", "Button")}
+        ${quickAddButton("card", "Card")}
+        ${quickAddButton("input", "Input")}
+        <button class="secondary-button compact" data-action="add-page">${icon("pages")} Page</button>
+        <span class="toolbar-separator"></span>
+        <button class="icon-button" title="Undo (Ctrl+Z)" aria-label="Undo" data-action="undo">${icon("undo")}</button>
+        <button class="icon-button" title="Redo (Ctrl+Y)" aria-label="Redo" data-action="redo">${icon("redo")}</button>
+        <button class="icon-button" title="Zoom out (Ctrl+-)" aria-label="Zoom out" data-action="zoom-out">${icon("zoomOut")}</button>
+        <span class="zoom-readout">${app.model?.zoom ?? 100}%</span>
+        <button class="icon-button" title="Zoom in (Ctrl++)" aria-label="Zoom in" data-action="zoom-in">${icon("zoomIn")}</button>
+        <button class="icon-button" title="Fit canvas (Ctrl+0)" aria-label="Fit canvas" data-action="fit">${icon("fit")}</button>
+      </div>
+      <div class="top-actions">
+        <select data-action="open-project-select" aria-label="Open project">
+          <option value="">Open project...</option>
+          ${app.projects.map((project) => `<option value="${project.id}" ${project.id === app.project?.id ? "selected" : ""}>${escapeHtml(project.name)}</option>`).join("")}
+        </select>
+        <button class="secondary-button compact" data-action="new-project">New</button>
+        <button class="secondary-button compact" data-action="open-import">${icon("import")} Import</button>
+        <button class="secondary-button compact" data-action="preview">${icon("preview")} Run</button>
+        <button class="primary-button compact" data-action="save">${icon("save")} Save</button>
+        <button class="icon-button" title="${app.topCollapsed ? "Show chrome" : "Hide chrome"}" aria-label="${app.topCollapsed ? "Show chrome" : "Hide chrome"}" data-action="toggle-top">${app.topCollapsed ? icon("expand") : icon("collapse")}</button>
+      </div>
+    </header>
+  `;
+}
+
+function quickAddButton(type: ElementType, label: string): string {
+  return `<button class="secondary-button compact" data-add-element="${type}">${icon("add")} ${label}</button>`;
+}
+
+function leftPanelMarkup(): string {
+  return `
+    <aside class="left-panel" aria-label="Editor library">
+      <button class="panel-collapse left" title="${app.leftCollapsed ? "Show left panel" : "Hide left panel"}" aria-label="${app.leftCollapsed ? "Show left panel" : "Hide left panel"}" data-action="toggle-left">${app.leftCollapsed ? icon("expand") : icon("collapse")}</button>
+      <div class="panel-tabs">
+        ${panelButton("pages", "pages", "Pages")}
+        ${panelButton("components", "components", "Build")}
+        ${panelButton("reuse", "reuse", "Reuse")}
+        ${panelButton("assets", "image", "Assets")}
+        ${panelButton("themes", "theme", "Theme")}
+        ${panelButton("import", "import", "Import")}
+      </div>
+      <div class="panel-body">${leftPanelBody()}</div>
+    </aside>
+  `;
+}
+
+function panelButton(id: PanelId, iconName: keyof typeof iconPaths, label: string): string {
+  return `<button class="${app.activePanel === id ? "is-active" : ""}" data-panel="${id}" title="${label}">${icon(iconName)}<span>${label}</span></button>`;
+}
+
+function leftPanelBody(): string {
+  if (!app.model || !app.project) return projectStartMarkup();
+  if (app.activePanel === "pages") return pagesPanelMarkup();
+  if (app.activePanel === "components") return componentsPanelMarkup();
+  if (app.activePanel === "reuse") return reusePanelMarkup();
+  if (app.activePanel === "assets") return assetsPanelMarkup();
+  if (app.activePanel === "themes") return themesPanelMarkup();
+  return importPanelMarkup();
+}
+
+function projectStartMarkup(): string {
+  return `
+    <section class="panel-section">
+      <h2>Start editing</h2>
+      <button class="primary-button full" data-action="new-project">New project</button>
+      <button class="secondary-button full" data-action="open-import">Import HTML</button>
     </section>
   `;
 }
 
-function editorView(): string {
-  if (!state.project) return noProjectView("Create or open a project to use the editor.");
-  const tabs = ["screens", "layers", "insert", "warnings"] as const;
-  const inspectors = ["content", "style", "layout", "behavior", "effects"] as const;
-  const activePageId = state.activeEditorPageId ?? state.project.pages[0]?.id;
-  const focusClass = state.focusCanvas ? `focus-canvas ${state.editorTab === "insert" ? "focus-toolbox" : ""}` : "";
+function pagesPanelMarkup(): string {
+  const page = activePage();
   return `
-    <section class="editor-shell ${focusClass}" style="--left-pane:${state.editorLeftWidth}px;--right-pane:${state.editorRightWidth}px;--canvas-height:${state.editorCanvasHeight}px">
-      <div class="editor-toolbar" role="toolbar" aria-label="Editor controls">
-        <label>Screen
-          <select data-action="select-editor-page">
-            ${state.project.pages.map((page) => `<option value="${page.id}" ${page.id === activePageId ? "selected" : ""}>${escapeHtml(page.name)}</option>`).join("")}
-          </select>
-        </label>
-        <div class="quick-command-bar" aria-label="Editing areas">
-          <button type="button" class="secondary-button compact ${state.editorTab === "screens" && !state.focusCanvas ? "is-active" : ""}" data-action="show-pages">${icon("pages")} Pages</button>
-          <button type="button" class="secondary-button compact ${state.editorTab === "insert" ? "is-active" : ""}" data-action="show-toolbox">${icon("toolbox")} Toolbox</button>
-          <button type="button" class="secondary-button compact" data-action="open-connections">${icon("connections")} Connections</button>
-          <button type="button" class="secondary-button compact ${!state.focusCanvas ? "is-active" : ""}" data-action="show-inspector">${icon("inspector")} Inspector</button>
-        </div>
-        <div class="segmented device-segment" aria-label="Device preview">
-          <button type="button" aria-pressed="true">Desktop</button>
-          <button type="button">Tablet</button>
-          <button type="button">Phone</button>
-        </div>
-        <button type="button" class="icon-button" title="Undo (Ctrl+Z)" aria-label="Undo" data-action="undo">${icon("undo")}</button>
-        <button type="button" class="icon-button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo" data-action="redo">${icon("redo")}</button>
-        <span class="toolbar-separator" aria-hidden="true"></span>
-        <button type="button" class="icon-button" title="Zoom out (Ctrl+-)" aria-label="Zoom out" data-action="zoom-out">${icon("zoomOut")}</button>
-        <span class="zoom-readout" data-zoom-readout>${state.editorZoom}%</span>
-        <button type="button" class="icon-button" title="Zoom in (Ctrl++)" aria-label="Zoom in" data-action="zoom-in">${icon("zoomIn")}</button>
-        <button type="button" class="icon-button" title="Fit canvas (Ctrl+0)" aria-label="Fit canvas" data-action="fit-canvas">${icon("fit")}</button>
-        <button type="button" class="secondary-button compact" title="Toggle full canvas" data-action="focus-canvas">${icon("focus")} ${state.focusCanvas ? "Show panels" : "Full canvas"}</button>
-        <span class="toolbar-separator" aria-hidden="true"></span>
-        <button type="button" class="secondary-button compact" data-action="preview-project">${icon("preview")} Preview</button>
-        <button type="button" class="primary-button compact" data-action="save-now">${icon("save")} Save</button>
-      </div>
-      <aside class="context-pane">
-        <div class="tab-row">
-          ${tabs.map((tab) => `<button type="button" class="${state.editorTab === tab ? "is-active" : ""}" data-editor-tab="${tab}">${tab}</button>`).join("")}
-        </div>
-        ${editorContextMarkup()}
-      </aside>
-      <div class="pane-resizer left-resizer" data-resize-pane="left" role="separator" aria-label="Resize screen panel"></div>
-      <section class="canvas-pane">
-        <div id="gjs-mount" class="gjs-mount">${
-          state.editorError
-            ? `<div class="editor-error-panel"><h3>Editor did not open</h3><p>${escapeHtml(state.editorError)}</p><button type="button" class="primary-button" data-action="retry-editor">Try again</button></div>`
-            : `<div class="loading-panel">Loading visual editor...</div>`
-        }</div>
-        <div class="canvas-height-resizer" data-resize-pane="canvas-height" role="separator" aria-label="Resize canvas height"></div>
-      </section>
-      <div class="pane-resizer right-resizer" data-resize-pane="right" role="separator" aria-label="Resize inspector panel"></div>
-      <aside class="inspector-pane">
-        <div class="tab-row">
-          ${inspectors.map((tab) => `<button type="button" class="${state.inspectorTab === tab ? "is-active" : ""}" data-inspector-tab="${tab}">${tab}</button>`).join("")}
-        </div>
-        ${inspectorMarkup()}
-      </aside>
-    </section>
-  `;
-}
-
-function editorContextMarkup(): string {
-  if (!state.project) return "";
-  if (state.editorTab === "screens") {
-    const activePageId = state.activeEditorPageId ?? state.project.pages[0]?.id;
-    return `
+    <section class="panel-section">
+      <div class="section-head"><h2>Pages</h2><button class="secondary-button compact" data-action="add-page">${icon("add")} Add</button></div>
       <div class="list-stack">
-        ${state.project.pages
+        ${app.model!.pages
           .map(
-            (page, index) => `<button type="button" class="screen-row ${page.id === activePageId ? "is-active" : ""}" data-open-page="${page.id}">
-              <span>${index + 1}</span><strong>${escapeHtml(page.name)}</strong><small>${page.componentCount} nodes</small>
-            </button>`
+            (candidate, index) => `
+              <button class="page-row ${candidate.id === page?.id ? "is-active" : ""}" data-page-id="${candidate.id}">
+                <span>${index + 1}</span>
+                <strong>${escapeHtml(candidate.name)}</strong>
+                <small>${candidate.width} x ${candidate.height}, ${candidate.elements.length} elements</small>
+              </button>`
           )
           .join("")}
       </div>
-      <button type="button" class="secondary-button full" data-action="add-screen">Add screen</button>
-    `;
-  }
-  if (state.editorTab === "layers") {
-    return `<div class="list-stack">${state.project.pages
-      .map((page) => `<div class="item-row"><div><strong>${escapeHtml(page.name)}</strong><span>${escapeHtml(page.slug)}</span></div></div>`)
-      .join("")}</div>`;
-  }
-  if (state.editorTab === "insert") {
-    return `
-      <div class="block-grid">
-        <button type="button" data-action="insert-block" data-block="section">Section</button>
-        <button type="button" data-action="insert-block" data-block="card">Card</button>
-        <button type="button" data-action="insert-block" data-block="button">Button</button>
-        <button type="button" data-action="insert-block" data-block="input">Input</button>
+      <label class="field-label">Page name <input type="text" data-page-prop="name" value="${escapeAttribute(page?.name ?? "")}"></label>
+    </section>
+    <section class="panel-section">
+      <h2>Layers</h2>
+      <div class="list-stack layer-stack">
+        ${(page?.elements ?? [])
+          .slice()
+          .sort((a, b) => b.z - a.z)
+          .map(
+            (element) => `
+            <button class="layer-row ${app.selectedIds.includes(element.id) ? "is-active" : ""}" data-layer-id="${element.id}">
+              ${icon("layers")}
+              <span>${escapeHtml(element.name)}</span>
+              <small>${escapeHtml(element.type)}${element.hidden ? " hidden" : ""}${element.locked ? " locked" : ""}</small>
+            </button>`
+          )
+          .join("") || `<p class="muted">No elements yet. Add one from Build.</p>`}
       </div>
-      <button type="button" class="secondary-button full" data-action="save-selection-library">Save selected as reusable</button>
-    `;
-  }
-  const warnings = [
-    ...state.project.connections.filter((connection) => connection.status !== "mapped").map((connection) => `${connection.triggerLabel} points to ${connection.targetName ?? "an unresolved target"}.`),
-    ...(state.report?.accessibility ?? [])
+    </section>
+  `;
+}
+
+function componentsPanelMarkup(): string {
+  const groups: Array<{ title: string; items: Array<[ElementType, string, string]> }> = [
+    { title: "Layout", items: [["frame", "Frame", "Containers and sections"], ["card", "Card", "Panels and tiles"], ["shape", "Shape", "Circles or blocks"]] },
+    { title: "Content", items: [["text", "Text", "Headings and labels"], ["button", "Button", "Clickable actions"], ["image", "Image", "Local uploaded image"]] },
+    { title: "Forms", items: [["input", "Input", "Form fields"], ["html", "HTML", "Reusable imported markup"]] }
   ];
-  return warnings.length ? `<ul class="warning-list">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : `<p class="muted">No current-screen warnings.</p>`;
+  return groups
+    .map(
+      (group) => `
+      <section class="panel-section">
+        <h2>${group.title}</h2>
+        <div class="component-grid">
+          ${group.items.map(([type, label, hint]) => `<button class="component-tile" data-add-element="${type}"><strong>${escapeHtml(label)}</strong><span>${escapeHtml(hint)}</span></button>`).join("")}
+        </div>
+      </section>`
+    )
+    .join("");
 }
 
-function inspectorMarkup(): string {
-  if (!state.project) return "";
-  if (state.inspectorTab === "content") {
-    return `
-      <div data-selected-inspector>
-        ${selectedInspectorMarkup()}
+function reusePanelMarkup(): string {
+  const templates = app.model?.templates ?? [];
+  return `
+    <section class="panel-section">
+      <div class="section-head"><h2>Reusable UI</h2><button class="secondary-button compact" data-action="save-template">${icon("reuse")} Save</button></div>
+      <div class="list-stack">
+        ${templates
+          .map(
+            (template) => `
+              <button class="template-row" data-template-id="${template.id}">
+                <strong>${escapeHtml(template.name)}</strong>
+                <small>${escapeHtml(template.category)} - ${template.elements.length} element${template.elements.length === 1 ? "" : "s"}</small>
+              </button>`
+          )
+          .join("") || `<p class="muted">Select elements and save them here. Imported buttons/forms also land here.</p>`}
       </div>
-      <div class="inspector-divider"></div>
-      <label>Project name <input type="text" value="${escapeAttribute(state.project.name)}" data-action="project-name"></label>
-      <label>Project notes <textarea rows="5" data-action="project-notes">${escapeHtml(state.project.notes.general ?? "")}</textarea></label>
-    `;
-  }
-  if (state.inspectorTab === "behavior") {
-    return `
-      <p class="muted">Behavior is approved in Connections, then tested in the sandboxed behavior preview.</p>
-      <button type="button" class="secondary-button full" data-route="connections">Open Connections</button>
-    `;
-  }
-  if (state.inspectorTab === "effects") {
-    return `<div class="token-list">${(state.report?.css.keyframes ?? []).map((item) => `<span>${escapeHtml(item)}</span>`).join("") || "<p class='muted'>No imported keyframes detected.</p>"}</div>`;
-  }
-  return `<p class="muted">Use GrapesJS controls in the canvas for ${escapeHtml(state.inspectorTab)} edits. HTML Forge saves editor data into the project model.</p>`;
+    </section>
+    <section class="panel-section">
+      <h2>Shared Library</h2>
+      <div class="list-stack">
+        ${app.library
+          .slice(-10)
+          .map((item) => `<button class="template-row" data-library-id="${item.id}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.category)} - ${escapeHtml(item.scope)}</small></button>`)
+          .join("") || `<p class="muted">No saved library items yet.</p>`}
+      </div>
+    </section>
+  `;
 }
 
-function selectedInspectorMarkup(): string {
-  const selected = state.selectedComponent;
-  if (!selected) {
-    return `
-      <section class="selected-card empty-selection">
-        <h4>No element selected</h4>
-        <p>Click text, a button, a card, or any component on the canvas. The quick editor will appear here.</p>
-      </section>
-    `;
+function assetsPanelMarkup(): string {
+  return `
+    <section class="panel-section">
+      <h2>Local Assets</h2>
+      <label class="file-button full">
+        Upload image
+        <input type="file" accept="image/*" data-action="asset-upload">
+      </label>
+      <div class="list-stack asset-list">
+        ${(app.project?.assets ?? [])
+          .map(
+            (asset) => `
+              <button class="asset-row" data-asset-id="${asset.id}">
+                <span class="asset-thumb" style="${asset.dataUrl ? `background-image:url(${asset.dataUrl})` : ""}"></span>
+                <strong>${escapeHtml(asset.name)}</strong>
+                <small>${humanBytes(asset.size)}</small>
+              </button>`
+          )
+          .join("") || `<p class="muted">Uploaded images stay in this browser and can be inserted onto the canvas.</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function themesPanelMarkup(): string {
+  return `
+    <section class="panel-section">
+      <h2>Theme</h2>
+      <div class="theme-grid">
+        ${(Object.keys(themes) as ThemeId[])
+          .map((id) => {
+            const theme = themes[id];
+            return `
+              <button class="theme-card ${app.model?.theme === id ? "is-active" : ""}" data-theme-id="${id}">
+                <span class="theme-swatches"><i style="background:${theme.bg}"></i><i style="background:${theme.panel}"></i><i style="background:${theme.accent}"></i><i style="background:${theme.accent2}"></i></span>
+                <strong>${escapeHtml(theme.label)}</strong>
+              </button>`;
+          })
+          .join("")}
+      </div>
+    </section>
+    <section class="panel-section">
+      <h2>Canvas</h2>
+      ${canvasFieldsMarkup()}
+    </section>
+  `;
+}
+
+function importPanelMarkup(): string {
+  return `
+    <section class="panel-section">
+      <h2>Import</h2>
+      <button class="primary-button full" data-action="open-import">${icon("import")} Import HTML into editor</button>
+      <p class="muted">Imports are sanitized first, then converted into editable text, buttons, inputs, cards, and reusable imported components.</p>
+    </section>
+    <section class="panel-section">
+      <h2>Export</h2>
+      <button class="secondary-button full" data-action="export-html">Download HTML</button>
+      <button class="secondary-button full" data-action="export-json">Download JSON</button>
+      <button class="secondary-button full" data-action="export-zip">Download ZIP</button>
+    </section>
+  `;
+}
+
+function canvasMarkup(): string {
+  const page = activePage();
+  if (!app.model || !page) {
+    return `<main class="canvas-workspace empty-workspace"><div class="empty-start">${projectStartMarkup()}</div></main>`;
   }
+  const scale = app.model.zoom / 100;
+  return `
+    <main class="canvas-workspace" id="workspace">
+      <div class="stage">
+        <div class="canvas-size-wrap" style="width:${page.width * scale}px;height:${page.height * scale}px">
+          <section class="design-canvas ${app.model.grid ? "show-grid" : ""}" id="design-canvas" style="width:${page.width}px;height:${page.height}px;background:${page.background};transform:scale(${scale});">
+            ${page.elements.map((element) => elementMarkup(element)).join("")}
+          </section>
+        </div>
+      </div>
+      <div class="floating-tools">
+        <button class="tool-square ${app.activeTool === "select" ? "is-active" : ""}" data-tool="select" title="Select">${icon("pointer")}</button>
+        <button class="tool-square ${app.activeTool === "hand" ? "is-active" : ""}" data-tool="hand" title="Pan">${icon("hand")}</button>
+        <button class="tool-square ${app.activeTool === "text" ? "is-active" : ""}" data-tool="text" title="Text">${icon("text")}</button>
+        <button class="tool-square ${app.activeTool === "frame" ? "is-active" : ""}" data-tool="frame" title="Frame">${icon("frame")}</button>
+        <span>${page.width} x ${page.height}</span>
+      </div>
+    </main>
+  `;
+}
+
+function elementMarkup(element: ForgeElement): string {
+  const selected = app.selectedIds.includes(element.id);
+  const contentEditable = selected && ["text", "button", "card"].includes(element.type) && !element.locked;
+  const content = element.type === "html" ? element.html : compileElementContent(element);
+  const classes = ["canvas-element", `type-${element.type}`, selected ? "is-selected" : "", element.locked ? "is-locked" : "", element.hidden ? "is-hidden" : ""].filter(Boolean).join(" ");
+  const style = elementStyle(element);
+  return `
+    <div class="${classes}" data-element-id="${element.id}" style="${escapeAttribute(style)}">
+      <div class="element-content" ${contentEditable ? `contenteditable="true" data-inline-edit="${element.id}" spellcheck="false"` : ""}>${content}</div>
+      ${selected && !element.locked ? resizeHandlesMarkup() : ""}
+      ${selected ? `<span class="element-chip">${escapeHtml(element.name)}</span>` : ""}
+    </div>
+  `;
+}
+
+function resizeHandlesMarkup(): string {
+  return ["nw", "n", "ne", "e", "se", "s", "sw", "w"].map((handle) => `<span class="resize-handle ${handle}" data-resize-handle="${handle}"></span>`).join("");
+}
+
+function rightPanelMarkup(): string {
+  return `
+    <aside class="right-panel" aria-label="Inspector">
+      <button class="panel-collapse right" title="${app.rightCollapsed ? "Show inspector" : "Hide inspector"}" aria-label="${app.rightCollapsed ? "Show inspector" : "Hide inspector"}" data-action="toggle-right">${app.rightCollapsed ? icon("collapse") : icon("expand")}</button>
+      <div class="inspector-tabs">
+        ${inspectorTab("design", "Design")}
+        ${inspectorTab("layout", "Layout")}
+        ${inspectorTab("actions", "Actions")}
+        ${inspectorTab("canvas", "Canvas")}
+      </div>
+      <div class="inspector-body">${inspectorBodyMarkup()}</div>
+    </aside>
+  `;
+}
+
+function inspectorTab(id: InspectorTab, label: string): string {
+  return `<button class="${app.inspectorTab === id ? "is-active" : ""}" data-inspector-tab="${id}">${label}</button>`;
+}
+
+function inspectorBodyMarkup(): string {
+  const selected = selectedElement();
+  if (app.inspectorTab === "canvas" || !selected) return canvasInspectorMarkup();
+  if (app.inspectorTab === "layout") return layoutInspectorMarkup(selected);
+  if (app.inspectorTab === "actions") return actionsInspectorMarkup(selected);
+  return designInspectorMarkup(selected);
+}
+
+function selectedHeaderMarkup(selected: ForgeElement): string {
   return `
     <section class="selected-card">
-      <div class="panel-heading compact-heading">
-        <h4>${escapeHtml(selected.name || selected.tagName)}</h4>
-        <span>${escapeHtml(selected.tagName)}</span>
+      <div class="selected-icon">${escapeHtml(selected.type.slice(0, 1).toUpperCase())}</div>
+      <div>
+        <strong>${escapeHtml(selected.name)}</strong>
+        <span>${escapeHtml(selected.type)}${selected.locked ? " - locked" : ""}</span>
       </div>
-      <label>Text <textarea rows="3" data-selected-prop="text">${escapeHtml(selected.text)}</textarea></label>
+    </section>
+  `;
+}
+
+function designInspectorMarkup(selected: ForgeElement): string {
+  return `
+    ${selectedHeaderMarkup(selected)}
+    <section class="inspector-section">
+      <h2>Content</h2>
+      <label class="field-label">Name <input type="text" data-el-prop="name" value="${escapeAttribute(selected.name)}"></label>
+      ${
+        selected.type === "html"
+          ? `<label class="field-label">HTML <textarea rows="8" data-el-prop="html">${escapeHtml(selected.html)}</textarea></label>`
+          : `<label class="field-label">Text <textarea rows="5" data-el-prop="text">${escapeHtml(selected.text)}</textarea></label>`
+      }
+      <label class="field-label">Font family
+        <select data-el-prop="fontFamily">
+          ${[defaultFont, "Georgia, serif", "Courier New, monospace", "system-ui, sans-serif", "Impact, sans-serif"].map((font) => `<option value="${escapeAttribute(font)}" ${font === selected.fontFamily ? "selected" : ""}>${escapeHtml(font.split(",")[0])}</option>`).join("")}
+        </select>
+      </label>
       <div class="field-grid two">
-        <label>Width <input type="text" placeholder="auto" value="${escapeAttribute(selected.width)}" data-selected-prop="width"></label>
-        <label>Height <input type="text" placeholder="auto" value="${escapeAttribute(selected.height)}" data-selected-prop="height"></label>
+        <label class="field-label">Font <input type="number" data-el-prop="font" value="${selected.font}"></label>
+        <label class="field-label">Weight <input type="number" min="100" max="1000" step="100" data-el-prop="weight" value="${selected.weight}"></label>
       </div>
+    </section>
+    <section class="inspector-section">
+      <h2>Paint</h2>
       <div class="field-grid two">
-        <label>Fill <input type="color" value="${normalizeColor(selected.background)}" data-selected-prop="background"></label>
-        <label>Text <input type="color" value="${normalizeColor(selected.color, "#1b2433")}" data-selected-prop="color"></label>
+        <label class="field-label">Fill <input type="color" data-el-prop="fill" value="${normalizeColor(selected.fill, "#ffffff")}"></label>
+        <label class="field-label">Text <input type="color" data-el-prop="color" value="${normalizeColor(selected.color, "#172033")}"></label>
+        <label class="field-label">Border <input type="color" data-el-prop="border" value="${normalizeColor(selected.border, "#cbd5e1")}"></label>
+        <label class="field-label">Opacity <input type="number" min="0" max="100" data-el-prop="opacity" value="${selected.opacity}"></label>
       </div>
+      <label class="field-label">Shadow <input type="text" data-el-prop="shadow" value="${escapeAttribute(selected.shadow)}" placeholder="0 12px 34px rgba(0,0,0,.15)"></label>
+    </section>
+    <section class="button-row">
+      <button class="secondary-button compact" data-action="duplicate">${icon("reuse")} Duplicate</button>
+      <button class="secondary-button compact" data-action="save-template">${icon("reuse")} Save reusable</button>
+      <button class="ghost-button danger compact" data-action="delete">${icon("trash")} Delete</button>
+    </section>
+  `;
+}
+
+function layoutInspectorMarkup(selected: ForgeElement): string {
+  return `
+    ${selectedHeaderMarkup(selected)}
+    <section class="inspector-section">
+      <h2>Position</h2>
       <div class="field-grid two">
-        <label>Padding <input type="text" placeholder="12px" value="${escapeAttribute(selected.padding)}" data-selected-prop="padding"></label>
-        <label>Radius <input type="text" placeholder="6px" value="${escapeAttribute(selected.radius)}" data-selected-prop="radius"></label>
+        <label class="field-label">X <input type="number" data-el-prop="x" value="${selected.x}"></label>
+        <label class="field-label">Y <input type="number" data-el-prop="y" value="${selected.y}"></label>
+        <label class="field-label">W <input type="number" data-el-prop="w" value="${selected.w}"></label>
+        <label class="field-label">H <input type="number" data-el-prop="h" value="${selected.h}"></label>
+        <label class="field-label">Rotate <input type="number" data-el-prop="rotation" value="${selected.rotation}"></label>
+        <label class="field-label">Radius <input type="number" data-el-prop="radius" value="${selected.radius}"></label>
+        <label class="field-label">Border W <input type="number" data-el-prop="borderWidth" value="${selected.borderWidth}"></label>
+        <label class="field-label">Z <input type="number" data-el-prop="z" value="${selected.z}"></label>
+      </div>
+    </section>
+    <section class="inspector-section">
+      <h2>Arrange</h2>
+      <div class="align-grid">
+        ${["left", "center", "right", "top", "middle", "bottom", "distH", "distV"].map((action) => `<button class="mini-button" data-align="${action}">${escapeHtml(action)}</button>`).join("")}
       </div>
       <div class="button-row">
-        <button type="button" class="secondary-button compact" data-action="apply-selected-edit">Apply</button>
-        <button type="button" class="ghost-button compact danger" data-action="delete-selected">${icon("trash")} Delete</button>
+        <button class="secondary-button compact" data-action="bring-front">Bring front</button>
+        <button class="secondary-button compact" data-action="send-back">Send back</button>
       </div>
     </section>
   `;
 }
 
-function normalizeColor(value: string, fallback = "#ffffff"): string {
-  if (/^#[0-9a-f]{6}$/i.test(value)) return value;
-  const match = value.match(/^rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)$/i);
-  if (match) {
-    return `#${[match[1], match[2], match[3]].map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`;
-  }
-  return fallback;
-}
-
-function selectEditorPage(pageId: string): void {
-  if (!state.project || !state.project.pages.some((page) => page.id === pageId)) return;
-  state.activeEditorPageId = pageId;
-  mountedEditor?.selectPage(pageId);
-  state.selectedComponent = undefined;
-  updateSelectedInspectorOnly();
-  root.querySelectorAll<HTMLButtonElement>("[data-open-page]").forEach((button) => {
-    button.classList.toggle("is-active", button.dataset.openPage === pageId);
-  });
-}
-
-function updateZoomReadout(): void {
-  root.querySelector("[data-zoom-readout]")?.replaceChildren(document.createTextNode(`${Math.round(state.editorZoom)}%`));
-}
-
-function zoomEditor(delta: number): void {
-  state.editorZoom = Math.round(mountedEditor?.zoomBy(delta) ?? Math.min(160, Math.max(25, state.editorZoom + delta)));
-  updateZoomReadout();
-}
-
-function fitEditorCanvas(): void {
-  state.editorZoom = Math.round(mountedEditor?.fitCanvas() ?? state.editorZoom);
-  updateZoomReadout();
-}
-
-function toggleFocusCanvas(): void {
-  state.focusCanvas = !state.focusCanvas;
-  if (state.focusCanvas) state.editorTab = "insert";
-  render();
-}
-
-function showPagesPanel(): void {
-  state.focusCanvas = false;
-  state.editorTab = "screens";
-  render();
-}
-
-function showToolboxPanel(): void {
-  state.editorTab = "insert";
-  render();
-}
-
-function showInspectorPanel(): void {
-  state.focusCanvas = false;
-  state.inspectorTab = "content";
-  render();
-}
-
-function applySelectedEdit(): void {
-  const selected = state.selectedComponent;
-  const read = (prop: keyof SelectedComponentSnapshot): string =>
-    root.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-selected-prop="${prop}"]`)?.value.trim() ?? "";
-  const background = read("background");
-  const color = read("color");
-  const change: Partial<SelectedComponentSnapshot> = {
-    text: read("text"),
-    width: read("width"),
-    height: read("height"),
-    padding: read("padding"),
-    radius: read("radius")
-  };
-  if (selected?.background || background !== "#ffffff") change.background = background;
-  if (selected?.color || color !== "#1b2433") change.color = color;
-  mountedEditor?.updateSelected(change);
-  state.selectedComponent = mountedEditor?.getSelectedSnapshot();
-  updateSelectedInspectorOnly();
-}
-
-function deleteSelectedComponent(): void {
-  mountedEditor?.deleteSelected();
-  state.selectedComponent = undefined;
-  updateSelectedInspectorOnly();
-}
-
-function insertEditorBlock(block: string): void {
-  if (!mountedEditor) {
-    setToast("The editor is still opening. Try the toolbox again in a moment.");
-    return;
-  }
-  mountedEditor.insertBlock(block);
-  state.selectedComponent = mountedEditor.getSelectedSnapshot();
-  updateSelectedInspectorOnly();
-}
-
-function updateSelectedInspectorOnly(): void {
-  const target = root.querySelector<HTMLElement>("[data-selected-inspector]");
-  if (!target) return;
-  target.innerHTML = selectedInspectorMarkup();
-  target.querySelectorAll<HTMLElement>("[data-action]").forEach((element) => {
-    element.addEventListener("click", () => void handleAction(element.dataset.action ?? "", element));
-  });
-}
-
-function startPaneResize(kind: string, event: PointerEvent): void {
-  if (!["left", "right", "canvas-height"].includes(kind)) return;
-  const shell = root.querySelector<HTMLElement>(".editor-shell");
-  if (!shell) return;
-  event.preventDefault();
-  const startX = event.clientX;
-  const startY = event.clientY;
-  const startLeft = state.editorLeftWidth;
-  const startRight = state.editorRightWidth;
-  const startHeight = state.editorCanvasHeight;
-  document.body.classList.add("is-resizing");
-
-  const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
-  const onMove = (moveEvent: PointerEvent): void => {
-    if (kind === "left") {
-      state.editorLeftWidth = clamp(startLeft + moveEvent.clientX - startX, 176, 440);
-      shell.style.setProperty("--left-pane", `${state.editorLeftWidth}px`);
-    }
-    if (kind === "right") {
-      state.editorRightWidth = clamp(startRight - (moveEvent.clientX - startX), 220, 460);
-      shell.style.setProperty("--right-pane", `${state.editorRightWidth}px`);
-    }
-    if (kind === "canvas-height") {
-      state.editorCanvasHeight = clamp(startHeight + moveEvent.clientY - startY, 460, 1300);
-      shell.style.setProperty("--canvas-height", `${state.editorCanvasHeight}px`);
-    }
-    mountedEditor?.refreshCanvas();
-  };
-  const onEnd = (): void => {
-    document.body.classList.remove("is-resizing");
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", onEnd);
-    mountedEditor?.refreshCanvas();
-  };
-  window.addEventListener("pointermove", onMove);
-  window.addEventListener("pointerup", onEnd, { once: true });
-}
-
-function connectionsView(): string {
-  if (!state.project) return noProjectView("Open a project to repair connections.");
-  const filtered = state.project.connections.filter((connection) => {
-    if (state.connectionFilter === "issues") return connection.status !== "mapped";
-    if (state.connectionFilter === "mapped") return connection.status === "mapped";
-    return true;
-  });
-  const pageOptions = state.project.pages.map((page) => `<option value="${page.id}">${escapeHtml(page.name)}</option>`).join("");
+function actionsInspectorMarkup(selected: ForgeElement): string {
   return `
-    <section class="workspace-panel full-height">
-      <div class="panel-heading">
-        <h3>Connections</h3>
-        <div class="segmented">
-          ${(["all", "issues", "mapped"] as const)
-            .map((filter) => `<button type="button" class="${state.connectionFilter === filter ? "is-active" : ""}" data-connection-filter="${filter}">${filter}</button>`)
-            .join("")}
-        </div>
-      </div>
-      <div class="connections-layout">
-        <div class="table-wrap" role="region" aria-label="Connection table">
-          <table>
-            <thead><tr><th>Trigger</th><th>Action</th><th>Target</th><th>Status</th><th>Repair</th></tr></thead>
-            <tbody>
-              ${filtered
-                .map(
-                  (connection) => `<tr>
-                    <td>${escapeHtml(connection.triggerLabel)}</td>
-                    <td>${escapeHtml(connection.action)}</td>
-                    <td>${escapeHtml(connection.targetName ?? "Unresolved")}</td>
-                    <td><span class="status-badge ${connection.status}">${escapeHtml(connection.status)}</span></td>
-                    <td>
-                      <select data-repair-target="${connection.id}" aria-label="Select target for ${escapeAttribute(connection.triggerLabel)}">
-                        <option value="">Choose target</option>${pageOptions}
-                      </select>
-                      <button type="button" class="secondary-button compact" data-create-missing="${connection.id}">Create</button>
-                      <button type="button" class="ghost-button compact" data-unresolve="${connection.id}">Mark unresolved</button>
-                    </td>
-                  </tr>`
-                )
-                .join("")}
-            </tbody>
-          </table>
-        </div>
-        <figure class="map-panel">
-          <figcaption>SVG map mirrors the table for quick scanning; the table is the complete editor.</figcaption>
-          ${connectionSvg()}
-        </figure>
-      </div>
+    ${selectedHeaderMarkup(selected)}
+    <section class="inspector-section">
+      <h2>Click Action</h2>
+      <label class="field-label">Action
+        <select data-el-prop="action">
+          <option value="" ${selected.action === "" ? "selected" : ""}>None</option>
+          <option value="page" ${selected.action === "page" ? "selected" : ""}>Go to page</option>
+          <option value="toggle" ${selected.action === "toggle" ? "selected" : ""}>Toggle element</option>
+        </select>
+      </label>
+      <label class="field-label">Target
+        <select data-el-prop="target">
+          <option value="">Choose target...</option>
+          ${app.model!.pages.map((page) => `<option value="${page.id}" ${page.id === selected.target ? "selected" : ""}>${escapeHtml(page.name)}</option>`).join("")}
+          ${activePage()!.elements.map((element) => `<option value="${element.id}" ${element.id === selected.target ? "selected" : ""}>${escapeHtml(element.name)}</option>`).join("")}
+        </select>
+      </label>
+      <p class="muted">Page actions are exported as real product navigation.</p>
+    </section>
+    <section class="inspector-section">
+      <h2>Element State</h2>
+      <label class="check-row"><input type="checkbox" data-el-flag="locked" ${selected.locked ? "checked" : ""}> Locked</label>
+      <label class="check-row"><input type="checkbox" data-el-flag="hidden" ${selected.hidden ? "checked" : ""}> Hidden</label>
     </section>
   `;
 }
 
-function connectionSvg(): string {
-  if (!state.project) return "";
-  const pages = state.project.pages;
-  const width = 760;
-  const height = Math.max(260, pages.length * 86);
-  const nodes = pages
-    .map((page, index) => {
-      const y = 30 + index * 78;
-      return `<g><rect x="28" y="${y}" width="180" height="42" rx="6"></rect><text x="44" y="${y + 26}">${escapeHtml(page.name)}</text></g>`;
-    })
-    .join("");
-  const edges = state.project.connections
-    .map((connection) => {
-      const source = Math.max(0, pages.findIndex((page) => page.id === connection.sourcePageId));
-      const target = Math.max(0, pages.findIndex((page) => page.id === connection.targetId));
-      const sy = 51 + source * 78;
-      const ty = connection.targetId ? 51 + target * 78 : 38 + pages.length * 78;
-      const color = connection.status === "mapped" ? "#0f766e" : "#b45309";
-      return `<path d="M210 ${sy} C330 ${sy}, 390 ${ty}, 520 ${ty}" stroke="${color}" fill="none" stroke-width="2"></path><text x="532" y="${ty + 4}" fill="${color}">${escapeHtml(
-        connection.targetName ?? "missing target"
-      )}</text>`;
-    })
-    .join("");
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Connections map showing pages and navigation edges">${edges}${nodes}</svg>`;
-}
-
-function libraryView(): string {
-  if (!state.project) return noProjectView("Open a project to use the library.");
-  const suggestions = suggestLibraryItems(state.project);
-  const items = [...state.library, ...suggestions].filter((item) => item.scope === state.libraryFilter);
+function canvasInspectorMarkup(): string {
   return `
-    <section class="workspace-panel full-height">
-      <div class="panel-heading">
-        <h3>Library</h3>
-        <div class="segmented">
-          ${(["reusable", "project", "review"] as const)
-            .map((filter) => `<button type="button" class="${state.libraryFilter === filter ? "is-active" : ""}" data-library-filter="${filter}">${filter === "review" ? "Needs Review" : filter === "project" ? "This Project" : "Reusable"}</button>`)
-            .join("")}
-        </div>
+    <section class="selected-card">
+      <div class="selected-icon">C</div>
+      <div>
+        <strong>${escapeHtml(activePage()?.name ?? "Canvas")}</strong>
+        <span>${activePage()?.elements.length ?? 0} elements</span>
       </div>
-      <div class="library-grid">
-        ${
-          items.length
-            ? items
-                .map(
-                  (item) => `<article class="library-card">
-                    <h4>${escapeHtml(item.name)}</h4>
-                    <p>${escapeHtml(item.category)} - ${escapeHtml(item.scope)} - ${escapeHtml(item.fingerprint)}</p>
-                    <div class="preview-box">${item.html ?? escapeHtml(item.css ?? "")}</div>
-                    <div class="button-row">
-                      ${item.scope === "review" ? `<button type="button" class="primary-button compact" data-approve-library='${escapeAttribute(JSON.stringify(item))}'>Approve</button>` : ""}
-                      <button type="button" class="secondary-button compact" data-insert-library='${escapeAttribute(JSON.stringify(item))}'>Insert/apply</button>
-                    </div>
-                  </article>`
-                )
-                .join("")
-            : `<div class="empty-panel"><h3>No items here</h3><p>Reusable suggestions appear after importing repeated patterns or saving selections.</p></div>`
-        }
-      </div>
+    </section>
+    <section class="inspector-section">
+      <h2>Canvas</h2>
+      ${canvasFieldsMarkup()}
+    </section>
+    <section class="inspector-section">
+      <h2>Project</h2>
+      <label class="field-label">Project name <input type="text" data-project-name value="${escapeAttribute(app.project?.name ?? "")}"></label>
+      <button class="secondary-button full" data-action="request-storage">Request persistent storage</button>
+      <p class="muted">${escapeHtml(app.storageMessage)}</p>
     </section>
   `;
 }
 
-function reportView(): string {
-  if (!state.project) return noProjectView("Open or import a project to view reports.");
-  const report = state.report;
-  const source = state.project.source?.rawText ?? "Original source was not retained.";
-  const generated = createPrototypeHtml(state.project, { interactive: true });
+function canvasFieldsMarkup(): string {
+  const page = activePage();
   return `
-    <section class="report-layout">
-      <div class="workspace-panel">
-        <div class="panel-heading"><h3>Import Report</h3><span>${report ? report.stats.warningCount : 0} warnings</span></div>
-        ${
-          report
-            ? `<div class="metric-grid">
-                <div><strong>${report.stats.screenCount}</strong><span>Screens</span></div>
-                <div><strong>${report.stats.overlayCount}</strong><span>Overlays</span></div>
-                <div><strong>${report.stats.interactionCount}</strong><span>Interactions</span></div>
-                <div><strong>${report.stats.importMs}ms</strong><span>Import time</span></div>
-              </div>
-              <h4>Blocked Resources</h4>
-              <ul class="warning-list">${(report.resources.length ? report.resources : []).map((resource) => `<li>${escapeHtml(resource.url)} <small>${escapeHtml(resource.context)}</small></li>`).join("") || "<li>None</li>"}</ul>
-              <h4>Quarantined Scripts</h4>
-              <ul class="warning-list">${report.sanitization.quarantinedScripts.map((script) => `<li>${escapeHtml(script.location)} <small>${escapeHtml(script.sample)}</small></li>`).join("") || "<li>None</li>"}</ul>
-              <h4>Missing Targets</h4>
-              <ul class="warning-list">${report.missingTargets.map((target) => `<li>${escapeHtml(target)}</li>`).join("") || "<li>None</li>"}</ul>`
-            : `<p class="muted">This project has no import report.</p>`
-        }
-      </div>
-      <div class="comparison-grid">
-        <section class="workspace-panel">
-          <div class="panel-heading"><h3>Safe Source Preview</h3><span>sandboxed</span></div>
-          <iframe title="Safe source preview" sandbox="" srcdoc="${escapeAttribute(report?.sanitizedPreviewHtml ?? "")}"></iframe>
-        </section>
-        <section class="workspace-panel">
-          <div class="panel-heading"><h3>Edited Preview</h3><span>approved runtime</span></div>
-          <iframe title="Approved behavior preview" sandbox="allow-scripts" srcdoc="${escapeAttribute(generated)}"></iframe>
-        </section>
-      </div>
-      <div class="code-grid">
-        <label>Quarantined source <textarea readonly>${escapeHtml(source)}</textarea></label>
-        <label>Generated output <textarea readonly>${escapeHtml(generated)}</textarea></label>
-      </div>
-    </section>
+    <div class="field-grid two">
+      <label class="field-label">Width <input type="number" data-page-prop="width" value="${page?.width ?? 1200}"></label>
+      <label class="field-label">Height <input type="number" data-page-prop="height" value="${page?.height ?? 800}"></label>
+      <label class="field-label">Background <input type="color" data-page-prop="background" value="${normalizeColor(page?.background ?? "#ffffff")}"></label>
+    </div>
+    <label class="check-row"><input type="checkbox" data-model-flag="grid" ${app.model?.grid ? "checked" : ""}> Show grid</label>
+    <label class="check-row"><input type="checkbox" data-model-flag="snap" ${app.model?.snap ? "checked" : ""}> Snap to grid</label>
   `;
 }
 
-function exportView(): string {
-  if (!state.project) return noProjectView("Open a project to export.");
-  const hasAssets = state.project.assets.length > 0;
+function statusbarMarkup(): string {
+  const page = activePage();
   return `
-    <section class="export-grid">
-      <article class="export-option primary-export">
-        <h3>Portable Project Backup</h3>
-        <p>Includes project JSON, prototype HTML, report, local assets, and retained source when selected during import.</p>
-        <button type="button" class="primary-button" data-action="export-zip">Download .htmlforge.zip</button>
-      </article>
-      <article class="export-option primary-export">
-        <h3>HTML Prototype</h3>
-        <p>Standalone interactive HTML compiled from approved HTML Forge behavior only.</p>
-        <button type="button" class="primary-button" data-action="export-html">Download .html</button>
-      </article>
-      <article class="export-option">
-        <h3>Editable JSON</h3>
-        <p>${hasAssets ? "This project has assets; JSON alone is not portable." : "Safe for projects without external asset payloads."}</p>
-        <button type="button" class="secondary-button" data-action="export-json">Download JSON</button>
-      </article>
-      <article class="export-option">
-        <h3>Import Report</h3>
-        <p>Markdown report covering sanitization, blocked resources, interactions, and accessibility findings.</p>
-        <button type="button" class="secondary-button" data-action="export-report">Download report</button>
-      </article>
-      <article class="export-option">
-        <h3>AI Handoff Package</h3>
-        <p>Structured Markdown, JSON, and HTML for future iteration. Quarantined executable source is excluded.</p>
-        <button type="button" class="secondary-button" data-action="export-ai">Download handoff</button>
-      </article>
-    </section>
+    <footer class="statusbar">
+      <span data-save-state>${escapeHtml(statusText())}</span>
+      <span>${escapeHtml(page?.name ?? "No page")}</span>
+      <span data-element-count>${page?.elements.length ?? 0} elements</span>
+      <span>Zoom ${app.model?.zoom ?? 100}%</span>
+      <span>${app.storageUsage}</span>
+    </footer>
   `;
 }
 
-function settingsView(): string {
+function importDialogMarkup(): string {
+  const report = app.importDraft?.report;
   return `
-    <section class="settings-grid">
-      <div class="workspace-panel">
-        <div class="panel-heading"><h3>Storage Status</h3><span>${escapeHtml(state.storageUsage)}</span></div>
-        <p>${escapeHtml(state.storageMessage)}</p>
-        <button type="button" class="primary-button" data-action="persist-storage">Request persistent storage</button>
-      </div>
-      <div class="workspace-panel">
-        <div class="panel-heading"><h3>Privacy</h3><span>local only</span></div>
-        <p>No backend, cloud save, analytics, or runtime CDN scripts are used. GitHub Pages hosts the application files only.</p>
-      </div>
-      <div class="workspace-panel">
-        <div class="panel-heading"><h3>Cache Repair</h3><span>browser shell</span></div>
-        <p>Clear old production shell caches if the editor ever appears stuck after an update. Local projects remain in browser storage.</p>
-        <button type="button" class="secondary-button" data-action="check-update">Clear cached shell</button>
-      </div>
-      <div class="workspace-panel">
-        <div class="panel-heading"><h3>Decision History</h3><span>${state.decisions.length}</span></div>
-        <div class="list-stack">${state.decisions.slice(-12).map((decision) => `<div class="item-row"><div><strong>${escapeHtml(decision.label)}</strong><span>${escapeHtml(decision.decision)}</span></div></div>`).join("") || "<p class='muted'>No decisions recorded yet.</p>"}</div>
-      </div>
-    </section>
-  `;
-}
-
-function noProjectView(message: string): string {
-  return `<section class="empty-panel centered"><h3>No project open</h3><p>${escapeHtml(message)}</p><div class="button-row"><button type="button" class="primary-button" data-action="new-project">New project</button><button type="button" class="secondary-button" data-action="open-import">Import HTML</button></div></section>`;
-}
-
-function importStudio(): string {
-  const report = state.importDraft?.report;
-  return `
-    <div class="modal-backdrop" role="presentation">
-      <section class="import-studio" role="dialog" aria-modal="true" aria-labelledby="import-title">
+    <div class="modal-backdrop">
+      <section class="import-modal" role="dialog" aria-modal="true" aria-labelledby="import-title">
         <header>
-          <div>
-            <p class="eyebrow">Guided workflow</p>
-            <h2 id="import-title">Import Studio</h2>
-          </div>
-          <button type="button" class="icon-button" aria-label="Close Import Studio" data-action="close-import">X</button>
+          <h2 id="import-title">Import HTML</h2>
+          <button class="icon-button" data-action="close-import" aria-label="Close">X</button>
         </header>
         <div class="import-grid">
-          <section class="workspace-panel">
-            <div class="panel-heading"><h3>Source Intake</h3><span>inert</span></div>
-            <label class="file-button full">Choose HTML file<input type="file" accept=".html,.htm,text/html" data-action="import-html-file"></label>
-            <label>File name <input type="text" value="${escapeAttribute(state.importFileName)}" data-action="import-file-name"></label>
-            <label class="check-row"><input type="checkbox" data-action="retain-source" ${state.importRetainSource ? "checked" : ""}> Retain original source locally in the project backup</label>
-            <label>Paste HTML <textarea rows="12" data-action="import-source">${escapeHtml(state.importSourceText)}</textarea></label>
-            <button type="button" class="primary-button full" data-action="analyze-import">Analyze safely</button>
+          <section class="panel-section">
+            <label class="file-button full">Choose HTML<input type="file" accept=".html,.htm,text/html" data-action="import-html-file"></label>
+            <label class="field-label">File name <input type="text" data-action="import-file-name" value="${escapeAttribute(app.importFileName)}"></label>
+            <label class="check-row"><input type="checkbox" data-action="retain-source" ${app.importRetainSource ? "checked" : ""}> Retain source locally</label>
+            <label class="field-label">Paste HTML <textarea rows="14" data-action="import-source">${escapeHtml(app.importSourceText)}</textarea></label>
+            <button class="primary-button full" data-action="analyze-import">Analyze safely</button>
           </section>
-          <section class="workspace-panel">
-            <div class="panel-heading"><h3>Summary</h3><span>${report ? `${report.stats.warningCount} warnings` : "waiting"}</span></div>
+          <section class="panel-section">
+            <h2>Import Result</h2>
             ${
               report
                 ? `<div class="metric-grid">
                     <div><strong>${report.stats.screenCount}</strong><span>Screens</span></div>
-                    <div><strong>${report.stats.overlayCount}</strong><span>Overlays</span></div>
-                    <div><strong>${report.stats.interactionCount}</strong><span>Behaviors</span></div>
-                    <div><strong>${report.resources.length}</strong><span>Resources blocked</span></div>
+                    <div><strong>${report.stats.interactionCount}</strong><span>Actions</span></div>
+                    <div><strong>${report.resources.length}</strong><span>Resources</span></div>
+                    <div><strong>${app.importDraft?.report.sanitization.quarantinedScripts.length ?? 0}</strong><span>Scripts blocked</span></div>
                   </div>
-                  <p>${escapeHtml(state.importDraft?.project.importSummary ?? "")}</p>
-                  <div class="resource-list">${report.resources.map((resource) => `<span>${escapeHtml(resource.type)}: ${escapeHtml(resource.url)}</span>`).join("") || "<span>No remote resources blocked.</span>"}</div>
-                  <button type="button" class="primary-button full" data-action="accept-import">Convert to editable project</button>`
-                : `<p class="muted">Choose or paste HTML, then analyze. Source code is parsed without active rendering.</p>`
+                  <button class="primary-button full" data-action="accept-import">Convert to editor</button>`
+                : `<p class="muted">The file is parsed as inert text, sanitized, and converted into editable canvas elements.</p>`
             }
           </section>
-          <section class="workspace-panel preview-surface">
-            <div class="panel-heading"><h3>Safe Visual Preview</h3><span><code>sandbox=""</code></span></div>
-            <iframe title="Safe visual import preview" sandbox="" srcdoc="${escapeAttribute(report?.sanitizedPreviewHtml ?? "<p>No preview yet.</p>")}"></iframe>
+          <section class="preview-surface">
+            <iframe title="Safe import preview" sandbox="" srcdoc="${escapeAttribute(report?.sanitizedPreviewHtml ?? "<p>No preview yet.</p>")}"></iframe>
           </section>
         </div>
       </section>
@@ -925,45 +1335,40 @@ function importStudio(): string {
   `;
 }
 
-function previewDialog(): string {
+function openRunPreview(): void {
+  if (!app.project) return;
+  syncProjectModel();
+  const runtimeUrl = new URL(`${import.meta.env.BASE_URL}product-runtime.js`, window.location.origin).toString();
+  app.previewHtml = createProductHtml(app.project, { interactive: true, runtimeScriptUrl: runtimeUrl });
+  app.previewOpen = true;
+  render();
+}
+
+function closeRunPreview(): void {
+  app.previewOpen = false;
+  app.previewHtml = "";
+  render();
+}
+
+function previewDialogMarkup(): string {
   return `
-    <div class="modal-backdrop" role="presentation">
-      <section class="preview-dialog" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+    <div class="modal-backdrop">
+      <section class="preview-modal" role="dialog" aria-modal="true">
         <header>
-          <h2 id="preview-title">Approved Behavior Preview</h2>
-          <button type="button" class="icon-button" aria-label="Close preview" data-action="close-preview">X</button>
+          <h2>Run Product</h2>
+          <button class="icon-button" data-action="close-preview" aria-label="Close">X</button>
         </header>
-        <iframe title="Approved behavior preview" sandbox="allow-scripts" srcdoc="${escapeAttribute(state.previewHtml)}"></iframe>
+        <iframe title="Product run preview" sandbox="allow-scripts" srcdoc="${escapeAttribute(app.previewHtml)}"></iframe>
       </section>
     </div>
   `;
 }
 
 function bindEvents(): void {
-  root.querySelectorAll<HTMLElement>("[data-route]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const route = button.dataset.route as RouteId;
-      state.route = route;
-      render();
-    });
-  });
-
-  root.querySelectorAll<HTMLElement>("[data-open-project]").forEach((button) => {
-    button.addEventListener("click", () => void openProject(button.dataset.openProject as string));
-  });
-
-  root.querySelectorAll<HTMLElement>("[data-delete-project]").forEach((button) => {
-    button.addEventListener("click", () => void removeProject(button.dataset.deleteProject as string));
-  });
-
-  root.querySelectorAll<HTMLElement>("[data-duplicate-project]").forEach((button) => {
-    button.addEventListener("click", () => void duplicateProject(button.dataset.duplicateProject as string));
-  });
-
   root.querySelectorAll<HTMLElement>("[data-action]").forEach((element) => {
-    const action = element.dataset.action;
-    if (element instanceof HTMLInputElement && action === "import-project-file") {
-      element.addEventListener("change", () => void importProjectFile(element.files?.[0]));
+    const action = element.dataset.action ?? "";
+    if (element instanceof HTMLInputElement && action === "asset-upload") {
+      element.addEventListener("change", () => void uploadAsset(element.files?.[0]));
       return;
     }
     if (element instanceof HTMLInputElement && action === "import-html-file") {
@@ -972,118 +1377,142 @@ function bindEvents(): void {
     }
     if (element instanceof HTMLTextAreaElement && action === "import-source") {
       element.addEventListener("input", () => {
-        state.importSourceText = element.value;
+        app.importSourceText = element.value;
       });
       return;
     }
     if (element instanceof HTMLInputElement && action === "import-file-name") {
       element.addEventListener("input", () => {
-        state.importFileName = element.value || "import.html";
+        app.importFileName = element.value || "import.html";
       });
       return;
     }
     if (element instanceof HTMLInputElement && action === "retain-source") {
       element.addEventListener("change", () => {
-        state.importRetainSource = element.checked;
+        app.importRetainSource = element.checked;
       });
       return;
     }
-    if (element instanceof HTMLInputElement && action === "project-name") {
-      element.addEventListener("change", () => updateProjectName(element.value));
+    if (element instanceof HTMLSelectElement && action === "open-project-select") {
+      element.addEventListener("change", () => {
+        if (element.value) void openProject(element.value);
+      });
       return;
     }
-    if (element instanceof HTMLTextAreaElement && action === "project-notes") {
-      element.addEventListener("change", () => updateProjectNotes(element.value));
-      return;
-    }
-    if (element instanceof HTMLSelectElement && action === "select-editor-page") {
-      element.addEventListener("change", () => selectEditorPage(element.value));
-      return;
-    }
-    element.addEventListener("click", () => void handleAction(action ?? "", element));
+    element.addEventListener("click", () => void handleAction(action));
   });
 
-  root.querySelectorAll<HTMLButtonElement>("[data-editor-tab]").forEach((button) => {
+  root.querySelectorAll<HTMLElement>("[data-tool]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.editorTab = button.dataset.editorTab as AppState["editorTab"];
+      app.activeTool = button.dataset.tool as ToolId;
       render();
     });
   });
-  root.querySelectorAll<HTMLButtonElement>("[data-inspector-tab]").forEach((button) => {
+  root.querySelectorAll<HTMLElement>("[data-panel]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.inspectorTab = button.dataset.inspectorTab as AppState["inspectorTab"];
+      app.activePanel = button.dataset.panel as PanelId;
+      app.leftCollapsed = false;
       render();
     });
   });
-  root.querySelectorAll<HTMLButtonElement>("[data-connection-filter]").forEach((button) => {
+  root.querySelectorAll<HTMLElement>("[data-inspector-tab]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.connectionFilter = button.dataset.connectionFilter as AppState["connectionFilter"];
+      app.inspectorTab = button.dataset.inspectorTab as InspectorTab;
+      app.rightCollapsed = false;
       render();
     });
   });
-  root.querySelectorAll<HTMLButtonElement>("[data-library-filter]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.libraryFilter = button.dataset.libraryFilter as AppState["libraryFilter"];
-      render();
+  root.querySelectorAll<HTMLElement>("[data-add-element]").forEach((button) => {
+    button.addEventListener("click", () => addElement(button.dataset.addElement as ElementType));
+  });
+  root.querySelectorAll<HTMLElement>("[data-page-id]").forEach((button) => {
+    button.addEventListener("click", () => selectPage(button.dataset.pageId ?? ""));
+  });
+  root.querySelectorAll<HTMLElement>("[data-layer-id]").forEach((button) => {
+    button.addEventListener("click", () => selectElement(button.dataset.layerId ?? ""));
+  });
+  root.querySelectorAll<HTMLElement>("[data-template-id]").forEach((button) => {
+    button.addEventListener("click", () => insertTemplate(button.dataset.templateId ?? ""));
+  });
+  root.querySelectorAll<HTMLElement>("[data-library-id]").forEach((button) => {
+    button.addEventListener("click", () => insertLibraryItem(button.dataset.libraryId ?? ""));
+  });
+  root.querySelectorAll<HTMLElement>("[data-asset-id]").forEach((button) => {
+    button.addEventListener("click", () => insertAsset(button.dataset.assetId ?? ""));
+  });
+  root.querySelectorAll<HTMLElement>("[data-theme-id]").forEach((button) => {
+    button.addEventListener("click", () => applyTheme(button.dataset.themeId as ThemeId));
+  });
+  root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-el-prop]").forEach((field) => {
+    const eventName = field instanceof HTMLTextAreaElement || field.type === "color" || field.tagName === "SELECT" ? "input" : "change";
+    field.addEventListener(eventName, () => updateSelectedProp(field.dataset.elProp ?? "", field.value));
+  });
+  root.querySelectorAll<HTMLInputElement>("[data-el-flag]").forEach((field) => {
+    field.addEventListener("change", () => updateSelectedFlag(field.dataset.elFlag ?? "", field.checked));
+  });
+  root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-page-prop]").forEach((field) => {
+    const eventName = field.type === "color" ? "input" : "change";
+    field.addEventListener(eventName, () => updatePageProp(field.dataset.pageProp ?? "", field.value));
+  });
+  root.querySelectorAll<HTMLInputElement>("[data-model-flag]").forEach((field) => {
+    field.addEventListener("change", () => updateModelFlag(field.dataset.modelFlag ?? "", field.checked));
+  });
+  root.querySelectorAll<HTMLElement>("[data-align]").forEach((button) => {
+    button.addEventListener("click", () => alignSelection(button.dataset.align ?? ""));
+  });
+  root.querySelector<HTMLInputElement>("[data-project-name]")?.addEventListener("change", (event) => {
+    if (!app.project) return;
+    app.project.name = (event.target as HTMLInputElement).value || app.project.name;
+    markDirty(true);
+  });
+
+  const canvas = root.querySelector<HTMLElement>("#design-canvas");
+  const workspace = root.querySelector<HTMLElement>("#workspace");
+  canvas?.addEventListener("pointerdown", startCanvasPointer);
+  workspace?.addEventListener("pointerdown", startWorkspacePointer);
+  root.querySelectorAll<HTMLElement>("[data-element-id]").forEach((element) => element.addEventListener("pointerdown", startElementPointer));
+  root.querySelectorAll<HTMLElement>("[data-resize-handle]").forEach((handle) => handle.addEventListener("pointerdown", startResizePointer));
+  root.querySelectorAll<HTMLElement>("[data-inline-edit]").forEach((editable) => {
+    editable.addEventListener("input", () => {
+      const element = activePage()?.elements.find((candidate) => candidate.id === editable.dataset.inlineEdit);
+      if (!element) return;
+      element.text = editable.textContent ?? "";
+      markDirty(false);
     });
-  });
-  root.querySelectorAll<HTMLSelectElement>("[data-repair-target]").forEach((select) => {
-    select.addEventListener("change", () => repairConnection(select.dataset.repairTarget as string, select.value));
-  });
-  root.querySelectorAll<HTMLButtonElement>("[data-create-missing]").forEach((button) => {
-    button.addEventListener("click", () => createMissingTarget(button.dataset.createMissing as string));
-  });
-  root.querySelectorAll<HTMLButtonElement>("[data-unresolve]").forEach((button) => {
-    button.addEventListener("click", () => markConnectionUnresolved(button.dataset.unresolve as string));
-  });
-  root.querySelectorAll<HTMLButtonElement>("[data-open-page]").forEach((button) => {
-    button.addEventListener("click", () => selectEditorPage(button.dataset.openPage as string));
-  });
-  root.querySelectorAll<HTMLElement>("[data-resize-pane]").forEach((handle) => {
-    handle.addEventListener("pointerdown", (event) => startPaneResize(handle.dataset.resizePane ?? "", event));
-  });
-  root.querySelectorAll<HTMLButtonElement>("[data-approve-library]").forEach((button) => {
-    button.addEventListener("click", () => void approveLibrary(button.dataset.approveLibrary));
-  });
-  root.querySelectorAll<HTMLButtonElement>("[data-insert-library]").forEach((button) => {
-    button.addEventListener("click", () => void insertLibrary(button.dataset.insertLibrary));
+    editable.addEventListener("pointerdown", (event) => event.stopPropagation());
   });
 }
 
-async function handleAction(action: string, element: HTMLElement): Promise<void> {
+async function handleAction(action: string): Promise<void> {
   switch (action) {
     case "new-project":
-      await createNewProject();
+      await createNew();
       break;
     case "open-import":
-      state.importOpen = true;
+      app.importOpen = true;
       render();
       break;
     case "close-import":
-      state.importOpen = false;
+      app.importOpen = false;
       render();
       break;
     case "analyze-import":
-      analyzeImportFromState();
+      analyzeImport();
       break;
     case "accept-import":
       await acceptImport();
       break;
-    case "persist-storage":
-      await persistStorage();
+    case "save":
+      await saveNow(true);
       break;
-    case "save-now":
-      await saveNow();
-      break;
-    case "preview-project":
-      openPreview();
+    case "preview":
+      openRunPreview();
       break;
     case "close-preview":
-      state.previewOpen = false;
-      render();
+      closeRunPreview();
       break;
-    case "add-screen":
-      addScreen();
+    case "add-page":
+      addPage();
       break;
     case "undo":
       undo();
@@ -1092,45 +1521,43 @@ async function handleAction(action: string, element: HTMLElement): Promise<void>
       redo();
       break;
     case "zoom-out":
-      zoomEditor(-10);
+      setZoom((app.model?.zoom ?? 100) - 10);
       break;
     case "zoom-in":
-      zoomEditor(10);
+      setZoom((app.model?.zoom ?? 100) + 10);
       break;
-    case "fit-canvas":
-      fitEditorCanvas();
+    case "fit":
+      fitCanvas();
       break;
-    case "focus-canvas":
-      toggleFocusCanvas();
-      break;
-    case "show-pages":
-      showPagesPanel();
-      break;
-    case "show-toolbox":
-      showToolboxPanel();
-      break;
-    case "show-inspector":
-      showInspectorPanel();
-      break;
-    case "open-connections":
-      state.route = "connections";
+    case "toggle-left":
+      app.leftCollapsed = !app.leftCollapsed;
       render();
       break;
-    case "apply-selected-edit":
-      applySelectedEdit();
-      break;
-    case "delete-selected":
-      deleteSelectedComponent();
-      break;
-    case "retry-editor":
-      state.editorError = undefined;
+    case "toggle-right":
+      app.rightCollapsed = !app.rightCollapsed;
       render();
       break;
-    case "save-selection-library":
-      await saveSelectionAsLibrary();
+    case "toggle-top":
+      app.topCollapsed = !app.topCollapsed;
+      render();
       break;
-    case "export-zip":
-      await downloadZip();
+    case "duplicate":
+      duplicateSelection();
+      break;
+    case "delete":
+      deleteSelection();
+      break;
+    case "save-template":
+      await saveTemplate();
+      break;
+    case "bring-front":
+      arrangeSelection("front");
+      break;
+    case "send-back":
+      arrangeSelection("back");
+      break;
+    case "request-storage":
+      await requestStorage();
       break;
     case "export-html":
       downloadHtml();
@@ -1138,555 +1565,722 @@ async function handleAction(action: string, element: HTMLElement): Promise<void>
     case "export-json":
       downloadJson();
       break;
-    case "export-report":
-      downloadReport();
-      break;
-    case "export-ai":
-      downloadAiHandoff();
-      break;
-    case "check-update":
-      await checkServiceWorkerUpdate();
-      break;
-    case "insert-block":
-      insertEditorBlock(element.dataset.block ?? "section");
+    case "export-zip":
+      await downloadZip();
       break;
   }
 }
 
-async function createNewProject(): Promise<void> {
-  const project = createBlankProject();
+function addElement(type: ElementType, at?: { x: number; y: number }): void {
+  const page = activePage();
+  if (!app.model || !page) return;
+  pushHistory("add element");
+  const element = makeElement(type, at?.x ?? 90 + page.elements.length * 12, at?.y ?? 90 + page.elements.length * 12);
+  element.z = nextZ(page);
+  page.elements.push(element);
+  app.selectedIds = [element.id];
+  app.inspectorTab = type === "frame" ? "layout" : "design";
+  app.activeTool = "select";
+  markDirty(true);
+}
+
+function addPage(): void {
+  if (!app.model) return;
+  pushHistory("add page");
+  const page: ForgeDesignPage = {
+    id: createId("page"),
+    generatedId: generatedScreenId(app.model.pages.length),
+    name: `Page ${app.model.pages.length + 1}`,
+    slug: `page-${app.model.pages.length + 1}`,
+    width: 1200,
+    height: 800,
+    background: "#ffffff",
+    elements: [makeElement("text", 80, 80, { text: `Page ${app.model.pages.length + 1}`, font: 42, w: 520, h: 88, z: 1 })]
+  };
+  app.model.pages.push(page);
+  app.model.currentPageId = page.id;
+  app.selectedIds = [];
+  app.activePanel = "pages";
+  markDirty(true);
+}
+
+function selectPage(id: string): void {
+  if (!app.model?.pages.some((page) => page.id === id)) return;
+  app.model.currentPageId = id;
+  app.selectedIds = [];
+  render();
+}
+
+function selectElement(id: string, append = false): void {
+  const element = activePage()?.elements.find((candidate) => candidate.id === id);
+  if (!element) return;
+  if (append) {
+    app.selectedIds = app.selectedIds.includes(id) ? app.selectedIds.filter((selected) => selected !== id) : [...app.selectedIds, id];
+  } else {
+    app.selectedIds = [id];
+  }
+  app.rightCollapsed = false;
+  render();
+}
+
+function duplicateSelection(): void {
+  const page = activePage();
+  const selected = selectedElements();
+  if (!page || !selected.length) return;
+  pushHistory("duplicate");
+  const copies = selected.map((element) => ({ ...structuredClone(element), id: createId("el"), name: `${element.name} copy`, x: element.x + 24, y: element.y + 24, z: nextZ(page) }));
+  page.elements.push(...copies);
+  app.selectedIds = copies.map((copy) => copy.id);
+  markDirty(true);
+}
+
+function deleteSelection(): void {
+  const page = activePage();
+  if (!page || !app.selectedIds.length) return;
+  pushHistory("delete");
+  page.elements = page.elements.filter((element) => !app.selectedIds.includes(element.id) || element.locked);
+  app.selectedIds = [];
+  markDirty(true);
+}
+
+async function saveTemplate(): Promise<void> {
+  if (!app.model || !app.project) return;
+  const selected = selectedElements();
+  if (!selected.length) {
+    toast("Select something first.");
+    return;
+  }
+  const template: ForgeTemplate = {
+    id: createId("tpl"),
+    name: selected.length === 1 ? selected[0].name : `${selected.length} elements`,
+    category: "component",
+    elements: selected.map((element) => structuredClone(element))
+  };
+  pushHistory("save template");
+  app.model.templates.push(template);
+  await saveLibraryItem({
+    schemaVersion: PROJECT_SCHEMA_VERSION,
+    id: template.id,
+    scope: "reusable",
+    name: template.name,
+    category: "component",
+    html: selected.map((element) => compileElementContent(element, true)).join("\n"),
+    data: template,
+    fingerprint: slugify(`${template.name}-${template.elements.length}`),
+    createdAt: nowIso(),
+    modifiedAt: nowIso()
+  });
+  app.library = await listLibraryItems();
+  app.activePanel = "reuse";
+  markDirty(true);
+  toast("Saved as reusable UI.");
+}
+
+function insertTemplate(id: string): void {
+  const template = app.model?.templates.find((item) => item.id === id);
+  const page = activePage();
+  if (!template || !page) return;
+  pushHistory("insert template");
+  const copies = template.elements.map((element, index) => ({ ...structuredClone(element), id: createId("el"), x: element.x + 36 + index * 8, y: element.y + 36 + index * 8, z: nextZ(page) + index }));
+  page.elements.push(...copies);
+  app.selectedIds = copies.map((copy) => copy.id);
+  markDirty(true);
+}
+
+function insertLibraryItem(id: string): void {
+  const item = app.library.find((candidate) => candidate.id === id);
+  if (!item) return;
+  const template = item.data as ForgeTemplate | undefined;
+  if (template?.elements) {
+    insertTemplateFromData(template);
+    return;
+  }
+  addElement("html", { x: 100, y: 100 });
+  const selected = selectedElement();
+  if (selected) {
+    selected.name = item.name;
+    selected.html = item.html ?? "<p>Reusable component</p>";
+    markDirty(true);
+  }
+}
+
+function insertTemplateFromData(template: ForgeTemplate): void {
+  const page = activePage();
+  if (!page) return;
+  pushHistory("insert library item");
+  const copies = template.elements.map((element, index) => ({ ...structuredClone(element), id: createId("el"), x: element.x + 40 + index * 8, y: element.y + 40 + index * 8, z: nextZ(page) + index }));
+  page.elements.push(...copies);
+  app.selectedIds = copies.map((copy) => copy.id);
+  markDirty(true);
+}
+
+async function uploadAsset(file?: File): Promise<void> {
+  if (!file || !app.project) return;
+  if (file.size > MAX_IMAGE_BYTES) {
+    toast("Image must be under 1.5 MB.");
+    return;
+  }
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+  pushHistory("upload asset");
+  const asset: ForgeAsset = { id: createId("asset"), name: file.name, mimeType: file.type, size: file.size, dataUrl };
+  app.project.assets.push(asset);
+  app.activePanel = "assets";
+  markDirty(true);
+}
+
+function insertAsset(id: string): void {
+  const asset = app.project?.assets.find((item) => item.id === id);
+  const page = activePage();
+  if (!asset || !page) return;
+  pushHistory("insert asset");
+  const element = makeElement("image", 90, 90, { name: asset.name, text: asset.name, assetId: asset.id, assetData: asset.dataUrl, z: nextZ(page) });
+  page.elements.push(element);
+  app.selectedIds = [element.id];
+  markDirty(true);
+}
+
+function applyTheme(id: ThemeId): void {
+  if (!app.model) return;
+  pushHistory("theme");
+  app.model.theme = id;
+  const theme = themes[id];
+  activePage()!.background = theme.canvas;
+  markDirty(true);
+}
+
+function updateSelectedProp(prop: string, value: string): void {
+  const selected = selectedElements();
+  if (!selected.length) return;
+  pushHistory("property");
+  selected.forEach((element) => {
+    if (["x", "y", "w", "h", "rotation", "borderWidth", "radius", "font", "weight", "opacity", "z"].includes(prop)) {
+      (element as unknown as Record<string, number>)[prop] = Number(value) || 0;
+    } else if (prop === "action") {
+      element.action = value as ForgeElement["action"];
+    } else {
+      (element as unknown as Record<string, string>)[prop] = value;
+    }
+  });
+  markDirty(true);
+}
+
+function updateSelectedFlag(flag: string, value: boolean): void {
+  const selected = selectedElements();
+  if (!selected.length || !["locked", "hidden"].includes(flag)) return;
+  pushHistory("state");
+  selected.forEach((element) => {
+    (element as unknown as Record<string, boolean>)[flag] = value;
+  });
+  markDirty(true);
+}
+
+function updatePageProp(prop: string, value: string): void {
+  const page = activePage();
+  if (!page || !["name", "width", "height", "background"].includes(prop)) return;
+  pushHistory("page");
+  if (prop === "width" || prop === "height") (page as unknown as Record<string, number>)[prop] = Math.max(prop === "width" ? 320 : 420, Number(value) || 0);
+  else (page as unknown as Record<string, string>)[prop] = value;
+  if (prop === "name") page.slug = slugify(value);
+  markDirty(true);
+}
+
+function updateModelFlag(flag: string, value: boolean): void {
+  if (!app.model || !["grid", "snap"].includes(flag)) return;
+  pushHistory("model flag");
+  (app.model as unknown as Record<string, boolean>)[flag] = value;
+  markDirty(true);
+}
+
+function alignSelection(action: string): void {
+  const selected = selectedElements();
+  if (selected.length < 2) {
+    toast(action.startsWith("dist") ? "Select 3+ elements to distribute." : "Select 2+ elements to align.");
+    return;
+  }
+  if (action.startsWith("dist") && selected.length < 3) {
+    toast("Select 3+ elements to distribute.");
+    return;
+  }
+  pushHistory("align");
+  const minX = Math.min(...selected.map((element) => element.x));
+  const maxX = Math.max(...selected.map((element) => element.x + element.w));
+  const minY = Math.min(...selected.map((element) => element.y));
+  const maxY = Math.max(...selected.map((element) => element.y + element.h));
+  selected.forEach((element) => {
+    if (action === "left") element.x = minX;
+    if (action === "right") element.x = maxX - element.w;
+    if (action === "center") element.x = minX + (maxX - minX - element.w) / 2;
+    if (action === "top") element.y = minY;
+    if (action === "bottom") element.y = maxY - element.h;
+    if (action === "middle") element.y = minY + (maxY - minY - element.h) / 2;
+  });
+  if (action === "distH") {
+    const sorted = selected.slice().sort((a, b) => a.x - b.x);
+    const total = sorted.reduce((sum, element) => sum + element.w, 0);
+    const gap = (maxX - minX - total) / (sorted.length - 1);
+    let cursor = minX;
+    sorted.forEach((element) => {
+      element.x = Math.round(cursor);
+      cursor += element.w + gap;
+    });
+  }
+  if (action === "distV") {
+    const sorted = selected.slice().sort((a, b) => a.y - b.y);
+    const total = sorted.reduce((sum, element) => sum + element.h, 0);
+    const gap = (maxY - minY - total) / (sorted.length - 1);
+    let cursor = minY;
+    sorted.forEach((element) => {
+      element.y = Math.round(cursor);
+      cursor += element.h + gap;
+    });
+  }
+  markDirty(true);
+}
+
+function arrangeSelection(direction: "front" | "back"): void {
+  const page = activePage();
+  const selected = selectedElements();
+  if (!page || !selected.length) return;
+  pushHistory("arrange");
+  if (direction === "front") selected.forEach((element) => (element.z = nextZ(page)));
+  else selected.forEach((element, index) => (element.z = index + 1));
+  markDirty(true);
+}
+
+function startWorkspacePointer(event: PointerEvent): void {
+  if (event.target !== event.currentTarget || app.activeTool !== "hand") return;
+  const workspace = event.currentTarget as HTMLElement;
+  app.drag = {
+    kind: "pan",
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startCanvasX: 0,
+    startCanvasY: 0,
+    startScrollX: workspace.scrollLeft,
+    startScrollY: workspace.scrollTop,
+    originals: []
+  };
+  document.addEventListener("pointermove", onPointerMove);
+  document.addEventListener("pointerup", onPointerUp, { once: true });
+}
+
+function startCanvasPointer(event: PointerEvent): void {
+  if (event.target !== event.currentTarget) return;
+  const point = canvasPoint(event);
+  if (!point) return;
+  if (app.activeTool === "text") {
+    addElement("text", point);
+    return;
+  }
+  if (app.activeTool === "frame") {
+    addElement("frame", point);
+    return;
+  }
+  app.selectedIds = [];
+  render();
+}
+
+function startElementPointer(event: PointerEvent): void {
+  const node = event.currentTarget as HTMLElement;
+  const id = node.dataset.elementId ?? "";
+  const element = activePage()?.elements.find((candidate) => candidate.id === id);
+  if (!element || element.locked || app.activeTool !== "select") return;
+  event.stopPropagation();
+  if (!app.selectedIds.includes(id)) app.selectedIds = event.shiftKey ? [...app.selectedIds, id] : [id];
+  const point = canvasPoint(event);
+  if (!point) return;
+  const selected = selectedElements();
+  app.drag = {
+    kind: "drag",
+    id,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startCanvasX: point.x,
+    startCanvasY: point.y,
+    originals: selected.map((item) => ({ id: item.id, x: item.x, y: item.y, w: item.w, h: item.h }))
+  };
+  pushHistory("move");
+  document.addEventListener("pointermove", onPointerMove);
+  document.addEventListener("pointerup", onPointerUp, { once: true });
+  render();
+}
+
+function startResizePointer(event: PointerEvent): void {
+  const handle = (event.currentTarget as HTMLElement).dataset.resizeHandle ?? "";
+  const selected = selectedElement();
+  if (!selected || selected.locked) return;
+  event.stopPropagation();
+  const point = canvasPoint(event);
+  if (!point) return;
+  app.drag = {
+    kind: "resize",
+    id: selected.id,
+    handle,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startCanvasX: point.x,
+    startCanvasY: point.y,
+    originals: [{ id: selected.id, x: selected.x, y: selected.y, w: selected.w, h: selected.h }],
+    ratio: selected.w / selected.h
+  };
+  pushHistory("resize");
+  document.addEventListener("pointermove", onPointerMove);
+  document.addEventListener("pointerup", onPointerUp, { once: true });
+}
+
+function canvasPoint(event: PointerEvent | MouseEvent): { x: number; y: number } | undefined {
+  const canvas = root.querySelector<HTMLElement>("#design-canvas");
+  if (!canvas || !app.model) return undefined;
+  const rect = canvas.getBoundingClientRect();
+  const scale = app.model.zoom / 100;
+  return { x: (event.clientX - rect.left) / scale, y: (event.clientY - rect.top) / scale };
+}
+
+function onPointerMove(event: PointerEvent): void {
+  if (!app.drag) return;
+  if (app.drag.kind === "pan") {
+    const workspace = root.querySelector<HTMLElement>("#workspace");
+    if (!workspace) return;
+    workspace.scrollLeft = (app.drag.startScrollX ?? 0) - (event.clientX - app.drag.startClientX);
+    workspace.scrollTop = (app.drag.startScrollY ?? 0) - (event.clientY - app.drag.startClientY);
+    return;
+  }
+  const point = canvasPoint(event);
+  if (!point) return;
+  const page = activePage();
+  if (!page) return;
+  if (app.drag.kind === "drag") {
+    const dx = point.x - app.drag.startCanvasX;
+    const dy = point.y - app.drag.startCanvasY;
+    app.drag.originals.forEach((original) => {
+      const element = page.elements.find((item) => item.id === original.id);
+      if (!element || element.locked) return;
+      element.x = snap(original.x + dx);
+      element.y = snap(original.y + dy);
+    });
+    updateCanvasElementsOnly();
+    return;
+  }
+  if (app.drag.kind === "resize") {
+    const original = app.drag.originals[0];
+    const element = page.elements.find((item) => item.id === original.id);
+    if (!element) return;
+    let x = original.x;
+    let y = original.y;
+    let w = original.w;
+    let h = original.h;
+    const dx = point.x - app.drag.startCanvasX;
+    const dy = point.y - app.drag.startCanvasY;
+    const handle = app.drag.handle ?? "";
+    if (handle.includes("e")) w = original.w + dx;
+    if (handle.includes("s")) h = original.h + dy;
+    if (handle.includes("w")) {
+      x = original.x + dx;
+      w = original.w - dx;
+    }
+    if (handle.includes("n")) {
+      y = original.y + dy;
+      h = original.h - dy;
+    }
+    if (event.shiftKey && app.drag.ratio) {
+      if (handle.includes("e") || handle.includes("w")) h = w / app.drag.ratio;
+      else w = h * app.drag.ratio;
+    }
+    element.x = snap(x);
+    element.y = snap(y);
+    element.w = Math.max(12, snap(w));
+    element.h = Math.max(12, snap(h));
+    updateCanvasElementsOnly();
+  }
+}
+
+function onPointerUp(): void {
+  if (!app.drag) return;
+  app.drag = undefined;
+  document.removeEventListener("pointermove", onPointerMove);
+  markDirty(true);
+}
+
+function updateCanvasElementsOnly(): void {
+  const page = activePage();
+  if (!page) return;
+  page.elements.forEach((element) => {
+    const node = root.querySelector<HTMLElement>(`[data-element-id="${element.id}"]`);
+    if (!node) return;
+    node.style.left = `${element.x}px`;
+    node.style.top = `${element.y}px`;
+    node.style.width = `${element.w}px`;
+    node.style.height = `${element.h}px`;
+    node.style.transform = `rotate(${element.rotation}deg)`;
+  });
+}
+
+function undo(): void {
+  if (!app.model || !app.history.length) return;
+  app.redo.push(cloneModel(app.model));
+  app.model = app.history.pop();
+  app.selectedIds = [];
+  markDirty(true);
+}
+
+function redo(): void {
+  if (!app.model || !app.redo.length) return;
+  app.history.push(cloneModel(app.model));
+  app.model = app.redo.pop();
+  app.selectedIds = [];
+  markDirty(true);
+}
+
+function setZoom(value: number): void {
+  if (!app.model) return;
+  app.model.zoom = Math.min(200, Math.max(25, value));
+  render();
+}
+
+function fitCanvas(): void {
+  const page = activePage();
+  const workspace = root.querySelector<HTMLElement>("#workspace");
+  if (!app.model || !page || !workspace) return;
+  const availableW = workspace.clientWidth - 96;
+  const availableH = workspace.clientHeight - 96;
+  app.model.zoom = Math.max(25, Math.min(160, Math.floor(Math.min(availableW / page.width, availableH / page.height) * 100)));
+  render();
+}
+
+function normalizeColor(value: string, fallback = "#ffffff"): string {
+  if (/^#[0-9a-f]{6}$/i.test(value)) return value;
+  const match = value.match(/^rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)$/i);
+  if (match) return `#${[match[1], match[2], match[3]].map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`;
+  if (value === "transparent") return fallback;
+  return fallback;
+}
+
+async function createNew(): Promise<void> {
+  const project = createBlankProject("Forge UI Project");
+  app.project = project;
+  app.model = modelFromProject(project);
+  app.model.pages[0].elements = [
+    makeElement("text", 86, 82, { text: "New interface", font: 48, w: 640, h: 92, z: 1 }),
+    makeElement("card", 86, 190, { text: "Start from here\nAdd UI pieces from the Build panel, then save anything reusable.", w: 420, h: 180, z: 2 })
+  ];
+  syncProjectModel();
   await putProject(project);
-  state.projects = await listProjects();
-  state.project = project;
-  state.report = undefined;
-  state.route = "editor";
-  state.activeEditorPageId = project.pages[0]?.id;
-  state.editorError = undefined;
-  await establishLock(project.id);
+  app.projects = await listProjects();
+  app.history = [];
+  app.redo = [];
+  app.selectedIds = [];
   render();
 }
 
 async function openProject(id: string): Promise<void> {
   const project = await getProject(id);
   if (!project) {
-    setToast("Project was not found in local storage.");
+    toast("Project not found.");
     return;
   }
-  state.project = project;
-  state.report = project.importReportId ? await getImportReport(project.importReportId) : undefined;
-  state.route = "editor";
-  state.activeEditorPageId = project.pages[0]?.id;
-  state.editorError = undefined;
-  await establishLock(project.id);
-  render();
-}
-
-async function establishLock(projectId: string): Promise<void> {
-  activeLock?.release();
-  activeLock = await acquireProjectLock(projectId, instanceId, (message) => {
-    state.lockMessage = message;
-    renderStatusOnly();
-  });
-  state.lockMessage =
-    activeLock.state === "writable"
-      ? "Writable project lock active."
-      : activeLock.state === "readonly"
-        ? "Another tab has the write lock. This tab is read-only until takeover."
-        : "Project lock API unavailable; BroadcastChannel fallback is active.";
-}
-
-async function removeProject(id: string): Promise<void> {
-  await deleteProject(id);
-  if (state.project?.id === id) {
-    state.project = undefined;
-    state.report = undefined;
-    unmountEditor();
-  }
-  state.projects = await listProjects();
-  render();
-}
-
-async function duplicateProject(id: string): Promise<void> {
-  const project = await getProject(id);
-  if (!project) return;
-  const copy = cloneProject(project);
-  copy.id = createId("project");
-  copy.name = `${project.name} Copy`;
-  copy.slug = slugify(copy.name);
-  copy.revision = 1;
-  copy.createdAt = nowIso();
-  copy.modifiedAt = nowIso();
-  copy.importReportId = undefined;
-  await putProject(copy);
-  state.projects = await listProjects();
-  setToast("Project duplicated locally.");
+  app.project = project;
+  app.model = modelFromProject(project);
+  app.selectedIds = [];
+  app.history = [];
+  app.redo = [];
   render();
 }
 
 async function importHtmlFile(file?: File): Promise<void> {
   if (!file) return;
-  state.importFileName = file.name;
-  state.importSourceText = await file.text();
-  analyzeImportFromState();
+  app.importFileName = file.name;
+  app.importSourceText = await file.text();
+  analyzeImport();
 }
 
-function analyzeImportFromState(): void {
-  if (!state.importSourceText.trim()) {
-    setToast("Add HTML source before analysis.");
+function analyzeImport(): void {
+  if (!app.importSourceText.trim()) {
+    toast("Add HTML before analyzing.");
     return;
   }
-  state.importDraft = analyzeHtmlImport(state.importSourceText, state.importFileName, state.importRetainSource);
+  app.importDraft = analyzeHtmlImport(app.importSourceText, app.importFileName, app.importRetainSource);
   render();
 }
 
 async function acceptImport(): Promise<void> {
-  if (!state.importDraft) return;
-  const { project, report } = state.importDraft;
-  await putProject(project);
-  await saveImportReport(report);
-  for (const resource of report.resources) {
-    await saveDecision({
-      schemaVersion: PROJECT_SCHEMA_VERSION,
-      id: createId("decision"),
-      projectId: project.id,
-      kind: "resource",
-      label: resource.url,
-      decision: resource.decision,
-      details: resource.context,
-      createdAt: nowIso()
-    });
-  }
-  state.projects = await listProjects();
-  state.decisions = await listDecisions(project.id);
-  state.project = project;
-  state.report = report;
-  state.importOpen = false;
-  state.route = "editor";
-  state.activeEditorPageId = project.pages[0]?.id;
-  state.editorError = undefined;
-  await establishLock(project.id);
+  if (!app.importDraft) return;
+  const imported = app.importDraft.project;
+  app.project = imported;
+  app.model = modelFromImport(app.importDraft);
+  app.project.notes[MODEL_NOTE_KEY] = JSON.stringify(app.model);
+  app.project.importReportId = app.importDraft.report.id;
+  app.importDraft.report.projectId = app.project.id;
+  syncProjectModel();
+  await putProject(app.project);
+  await saveImportReport(app.importDraft.report);
+  await Promise.all(
+    app.model.templates.map((template) =>
+      saveLibraryItem({
+        schemaVersion: PROJECT_SCHEMA_VERSION,
+        id: template.id,
+        scope: "review",
+        name: template.name,
+        category: "component",
+        html: template.elements.map((element) => element.html || compileElementContent(element, true)).join("\n"),
+        data: template,
+        fingerprint: slugify(template.name),
+        createdAt: nowIso(),
+        modifiedAt: nowIso()
+      })
+    )
+  );
+  app.projects = await listProjects();
+  app.library = await listLibraryItems();
+  app.importOpen = false;
+  app.activePanel = "pages";
+  app.selectedIds = [];
+  app.history = [];
+  app.redo = [];
   render();
+  toast("Imported into editable canvas.");
 }
 
 async function importProjectFile(file?: File): Promise<void> {
   if (!file) return;
   const bytes = new Uint8Array(await file.arrayBuffer());
-  if (file.name.endsWith(".zip") || file.name.endsWith(".htmlforge.zip")) {
-    const entries = unzipSync(bytes);
-    const projectEntry = entries["project.htmlforge.json"] ?? entries["project.json"];
-    if (!projectEntry) throw new Error("Package does not contain project.htmlforge.json.");
-    const project = migrateProject(JSON.parse(strFromU8(projectEntry)));
-    project.id = createId("project");
-    project.name = `${project.name} Imported`;
-    project.slug = slugify(project.name);
-    project.revision = 1;
-    project.createdAt = nowIso();
-    project.modifiedAt = nowIso();
-    await putProject(project);
-    state.projects = await listProjects();
-    setToast("Portable package imported as a new local copy.");
-    await openProject(project.id);
-    return;
-  }
-  const text = new TextDecoder().decode(bytes);
+  const projectEntry = file.name.endsWith(".zip") || file.name.endsWith(".htmlforge.zip") ? unzipSync(bytes)["project.htmlforge.json"] ?? unzipSync(bytes)["project.json"] : undefined;
+  const text = projectEntry ? strFromU8(projectEntry) : new TextDecoder().decode(bytes);
   const project = migrateProject(JSON.parse(text));
   project.id = createId("project");
   project.name = `${project.name} Imported`;
   project.slug = slugify(project.name);
   project.revision = 1;
   await putProject(project);
-  state.projects = await listProjects();
-  state.activeEditorPageId = project.pages[0]?.id;
-  state.editorError = undefined;
+  app.projects = await listProjects();
   await openProject(project.id);
 }
 
-async function mountEditorIfNeeded(): Promise<void> {
-  if (!state.project) return;
-  const mount = root.querySelector<HTMLElement>("#gjs-mount");
-  if (!mount) return;
-  if (mountedEditor && mountedEditorProjectId === state.project.id) return;
-  unmountEditor();
-  const mountToken = ++editorMountToken;
-  try {
-    const editor = await mountGrapesEditor(mount, state.project, {
-      onChange(snapshot) {
-        if (mountToken !== editorMountToken) return;
-        if (!state.project) return;
-        const before = cloneProject(state.project);
-        syncProjectFromEditorSnapshot(snapshot);
-        mountedEditorSnapshotKey = editorSnapshotKey(snapshot);
-        markDirty("Visual editor change", before);
-      },
-      onSelection(snapshot) {
-        if (mountToken !== editorMountToken) return;
-        state.selectedComponent = snapshot;
-        updateSelectedInspectorOnly();
-      },
-      onError(error) {
-        if (mountToken !== editorMountToken) return;
-        state.saveError = `Editor failed: ${error.message}`;
-        state.editorError = error.message;
-      }
-    });
-    if (mountToken !== editorMountToken || !mount.isConnected || state.route !== "editor" || state.editorError) {
-      editor.destroy();
-      return;
-    }
-    mountedEditor = editor;
-    mountedEditorProjectId = state.project.id;
-    state.editorError = undefined;
-    state.editorZoom = Math.round(mountedEditor.setZoom(state.editorZoom));
-    mountedEditorSnapshotKey = editorSnapshotKey(mountedEditor.saveSnapshot());
-    updateZoomReadout();
-    selectEditorPage(state.activeEditorPageId ?? state.project.pages[0]?.id ?? "");
-  } catch (error) {
-    if (mountToken !== editorMountToken) return;
-    state.editorError = error instanceof Error ? error.message : String(error);
-    mountedEditor = undefined;
-    mountedEditorProjectId = undefined;
-    render();
-  }
-}
-
-function updateProjectName(value: string): void {
-  if (!state.project) return;
-  const before = cloneProject(state.project);
-  state.project.name = value || state.project.name;
-  state.project.slug = slugify(state.project.name);
-  markDirty("Rename project", before);
+async function requestStorage(): Promise<void> {
+  const status = await requestPersistentStorage();
+  app.storageMessage = status.message;
+  app.storageUsage = status.estimate ? `${humanBytes(status.estimate.usage)} / ${humanBytes(status.estimate.quota)}` : "";
   render();
-}
-
-function updateProjectNotes(value: string): void {
-  if (!state.project) return;
-  const before = cloneProject(state.project);
-  state.project.notes.general = value;
-  markDirty("Update project notes", before);
-}
-
-async function saveNow(): Promise<void> {
-  if (!state.project) return;
-  if (mountedEditor) {
-    const snapshot = mountedEditor.saveSnapshot();
-    state.project.grapesProjectData = snapshot.grapesProjectData;
-  }
-  try {
-    state.project = await saveProject(state.project, instanceId, state.project.revision);
-    state.projects = await listProjects();
-    state.dirty = false;
-    state.saveError = undefined;
-    setToast("Project saved locally.");
-  } catch (error) {
-    state.saveError = error instanceof Error ? error.message : String(error);
-    render();
-  }
-}
-
-function addScreen(): void {
-  if (!state.project) return;
-  const before = cloneProject(state.project);
-  const name = `Screen ${state.project.pages.length + 1}`;
-  const page = {
-    id: createId("page"),
-    generatedId: generatedScreenId(state.project.pages.length),
-    name,
-    slug: slugify(name),
-    html: `<main><h1>${escapeHtml(name)}</h1><p>New screen.</p></main>`,
-    css: "",
-    notes: "",
-    componentCount: 3,
-    createdAt: nowIso(),
-    modifiedAt: nowIso()
-  };
-  state.project.pages.push(page);
-  state.activeEditorPageId = page.id;
-  mountedEditor?.addPage(name, page.id);
-  mountedEditor?.selectPage(page.id);
-  markDirty("Add screen", before);
-  render();
-}
-
-function repairConnection(connectionId: string, targetId: string): void {
-  if (!state.project || !targetId) return;
-  const before = cloneProject(state.project);
-  const connection = state.project.connections.find((item) => item.id === connectionId);
-  const target = state.project.pages.find((page) => page.id === targetId);
-  if (!connection || !target) return;
-  connection.targetId = target.id;
-  connection.targetName = target.name;
-  connection.status = "mapped";
-  connection.action = "navigate";
-  connection.modifiedAt = nowIso();
-  markDirty("Repair connection", before);
-  render();
-}
-
-function createMissingTarget(connectionId: string): void {
-  if (!state.project) return;
-  const connection = state.project.connections.find((item) => item.id === connectionId);
-  if (!connection) return;
-  const before = cloneProject(state.project);
-  const name = connection.targetName ? connection.targetName.replace(/[-_]+/g, " ") : "Repaired Screen";
-  const page = {
-    id: createId("page"),
-    generatedId: generatedScreenId(state.project.pages.length),
-    name: name.replace(/\b\w/g, (letter) => letter.toUpperCase()),
-    slug: slugify(name),
-    html: `<main><h1>${escapeHtml(name)}</h1><p>Created to repair an imported connection.</p></main>`,
-    css: "",
-    notes: "",
-    componentCount: 3,
-    createdAt: nowIso(),
-    modifiedAt: nowIso()
-  };
-  state.project.pages.push(page);
-  connection.targetId = page.id;
-  connection.targetName = page.name;
-  connection.status = "mapped";
-  markDirty("Create missing target", before);
-  render();
-}
-
-function markConnectionUnresolved(connectionId: string): void {
-  if (!state.project) return;
-  const before = cloneProject(state.project);
-  const connection = state.project.connections.find((item) => item.id === connectionId);
-  if (!connection) return;
-  connection.status = "intentionally-unresolved";
-  connection.action = "unresolved";
-  connection.modifiedAt = nowIso();
-  markDirty("Mark connection unresolved", before);
-  render();
-}
-
-function undo(): void {
-  if (!state.project) return;
-  state.project = history.undo(state.project);
-  state.dirty = true;
-  scheduleSave();
-  render();
-}
-
-function redo(): void {
-  if (!state.project) return;
-  state.project = history.redo(state.project);
-  state.dirty = true;
-  scheduleSave();
-  render();
-}
-
-async function approveLibrary(raw?: string): Promise<void> {
-  if (!raw) return;
-  const item = JSON.parse(raw) as LibraryItem;
-  item.scope = "reusable";
-  item.modifiedAt = nowIso();
-  await saveLibraryItem(item);
-  state.library = await listLibraryItems();
-  setToast("Reusable library item saved locally.");
-  render();
-}
-
-async function insertLibrary(raw?: string): Promise<void> {
-  if (!raw || !state.project) return;
-  const item = JSON.parse(raw) as LibraryItem;
-  const before = cloneProject(state.project);
-  const page = state.project.pages[0];
-  if (item.html) page.html += `\n${item.html}`;
-  if (item.css) page.css += `\n${item.css}`;
-  page.componentCount += 1;
-  markDirty("Insert library item", before);
-  render();
-}
-
-async function saveSelectionAsLibrary(): Promise<void> {
-  if (!state.project) return;
-  const html = mountedEditor?.getSelectedHtml?.() || state.project.pages[0]?.html || "";
-  const item: LibraryItem = {
-    schemaVersion: PROJECT_SCHEMA_VERSION,
-    id: createId("library"),
-    scope: "reusable",
-    name: "Saved selection",
-    category: "component",
-    html,
-    css: "",
-    fingerprint: slugify(html.slice(0, 60)) || createId("fingerprint"),
-    createdAt: nowIso(),
-    modifiedAt: nowIso()
-  };
-  await saveLibraryItem(item);
-  state.library = await listLibraryItems();
-  setToast("Selection saved to the reusable library.");
-  render();
-}
-
-function openPreview(): void {
-  if (!state.project) return;
-  state.previewHtml = createPrototypeHtml(state.project, { interactive: true });
-  state.previewOpen = true;
-  render();
-}
-
-async function downloadZip(): Promise<void> {
-  if (!state.project) return;
-  const report = state.report ?? (state.project.importReportId ? await getImportReport(state.project.importReportId) : undefined);
-  const pkg = exportProjectPackage(state.project, report);
-  downloadBlob(pkg.blob, pkg.fileName);
 }
 
 function downloadHtml(): void {
-  if (!state.project) return;
-  const html = createPrototypeHtml(state.project, { interactive: true });
-  downloadBlob(new Blob([html], { type: "text/html" }), `${slugify(state.project.name)}_${formatFileStamp()}.html`);
+  if (!app.project) return;
+  syncProjectModel();
+  downloadBlob(new Blob([createProductHtml(app.project, { interactive: true })], { type: "text/html" }), `${slugify(app.project.name)}_${formatFileStamp()}.html`);
 }
 
 function downloadJson(): void {
-  if (!state.project) return;
-  if (state.project.assets.length && !window.confirm("This project has assets. JSON alone will not be portable to another machine. Export a ZIP backup instead unless you accept that limitation.")) return;
-  downloadBlob(new Blob([createProjectJson(state.project)], { type: "application/json" }), `${slugify(state.project.name)}_${formatFileStamp()}.htmlforge.json`);
+  if (!app.project) return;
+  syncProjectModel();
+  downloadBlob(new Blob([createProjectJson(app.project)], { type: "application/json" }), `${slugify(app.project.name)}_${formatFileStamp()}.htmlforge.json`);
 }
 
-function downloadReport(): void {
-  if (!state.report) {
-    setToast("No import report is attached to this project.");
-    return;
-  }
-  downloadBlob(new Blob([createImportReportMarkdown(state.report)], { type: "text/markdown" }), `${slugify(state.project?.name ?? "html-forge")}_${formatFileStamp()}_import-report.md`);
-}
-
-function downloadAiHandoff(): void {
-  if (!state.project) return;
-  const pkg = exportAiHandoff(state.project, state.report);
+async function downloadZip(): Promise<void> {
+  if (!app.project) return;
+  syncProjectModel();
+  const report = app.project.importReportId ? await getImportReport(app.project.importReportId) : undefined;
+  const pkg = exportProjectPackage(app.project, report);
   downloadBlob(pkg.blob, pkg.fileName);
 }
 
-async function persistStorage(): Promise<void> {
-  const status = await requestPersistentStorage();
-  state.storageMessage = status.message;
-  state.storageUsage = status.estimate ? `${humanBytes(status.estimate.usage)} / ${humanBytes(status.estimate.quota)}` : "";
-  render();
-}
-
-async function clearLegacyServiceWorkerCaches(): Promise<number> {
-  let cleared = 0;
-  if ("serviceWorker" in navigator) {
-    const registrations = await navigator.serviceWorker.getRegistrations();
-    await Promise.all(
-      registrations.map(async (registration) => {
-        if (await registration.unregister()) cleared += 1;
-      })
-    );
-  }
-  if ("caches" in window) {
-    const keys = await caches.keys();
-    const forgeKeys = keys.filter((key) => key.startsWith("html-forge"));
-    await Promise.all(forgeKeys.map((key) => caches.delete(key)));
-    cleared += forgeKeys.length;
-  }
-  return cleared;
-}
-
-async function checkServiceWorkerUpdate(): Promise<void> {
-  const cleared = await clearLegacyServiceWorkerCaches();
-  setToast(cleared ? "Cached app shell cleared. Reload if the editor was already open." : "No cached app shell was found.");
-}
-
-async function refreshLocalState(): Promise<void> {
-  state.projects = await listProjects();
-  state.library = await listLibraryItems();
-  state.decisions = await listDecisions(state.project?.id);
-  const storage = await getStorageStatus();
-  state.storageMessage = storage.message;
-  state.storageUsage = storage.estimate ? `${humanBytes(storage.estimate.usage)} / ${humanBytes(storage.estimate.quota)}` : "";
-}
-
-function bindUnloadProtection(): void {
-  window.addEventListener("beforeunload", (event) => {
-    if (!state.dirty && !state.saving && !state.saveError) return;
-    event.preventDefault();
-    event.returnValue = "";
-  });
-  window.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden" && state.project && state.dirty) void saveNow();
-  });
-  window.addEventListener("pagehide", () => {
-    if (state.project && state.dirty) void saveNow();
-    activeLock?.release();
-  });
-}
-
-function isTypingTarget(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target.isContentEditable;
-}
-
-function bindEditorKeyboardShortcuts(): void {
+function bindKeyboard(): void {
   window.addEventListener("keydown", (event) => {
-    if (state.route !== "editor" || state.previewOpen || state.importOpen) return;
-    const key = event.key.toLowerCase();
-    const commandKey = event.ctrlKey || event.metaKey;
-    if (commandKey && key === "s") {
-      event.preventDefault();
-      void saveNow();
+    if (app.importOpen || app.previewOpen) {
+      if (event.key === "Escape") {
+        app.importOpen = false;
+        if (app.previewOpen) closeRunPreview();
+        else render();
+      }
       return;
     }
-    if (commandKey && (event.key === "+" || event.key === "=")) {
+    const target = event.target;
+    const typing = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || (target instanceof HTMLElement && target.isContentEditable);
+    const command = event.ctrlKey || event.metaKey;
+    if (command && event.key.toLowerCase() === "s") {
       event.preventDefault();
-      zoomEditor(10);
+      void saveNow(true);
       return;
     }
-    if (commandKey && event.key === "-") {
-      event.preventDefault();
-      zoomEditor(-10);
-      return;
-    }
-    if (commandKey && event.key === "0") {
-      event.preventDefault();
-      fitEditorCanvas();
-      return;
-    }
-    if (commandKey && key === "z" && event.shiftKey) {
-      event.preventDefault();
-      redo();
-      return;
-    }
-    if (commandKey && key === "z") {
+    if (command && event.key.toLowerCase() === "z" && !event.shiftKey) {
       event.preventDefault();
       undo();
       return;
     }
-    if (commandKey && key === "y") {
+    if (command && (event.key.toLowerCase() === "y" || (event.key.toLowerCase() === "z" && event.shiftKey))) {
       event.preventDefault();
       redo();
       return;
     }
-    if (isTypingTarget(event.target)) return;
-    if (key === "f") {
+    if (command && event.key.toLowerCase() === "d") {
       event.preventDefault();
-      toggleFocusCanvas();
+      duplicateSelection();
+      return;
+    }
+    if (command && (event.key === "+" || event.key === "=")) {
+      event.preventDefault();
+      setZoom((app.model?.zoom ?? 100) + 10);
+      return;
+    }
+    if (command && event.key === "-") {
+      event.preventDefault();
+      setZoom((app.model?.zoom ?? 100) - 10);
+      return;
+    }
+    if (command && event.key === "0") {
+      event.preventDefault();
+      fitCanvas();
+      return;
+    }
+    if (typing) return;
+    if (event.key === "Escape") {
+      app.selectedIds = [];
+      app.activeTool = "select";
+      render();
       return;
     }
     if (event.key === "Delete" || event.key === "Backspace") {
       event.preventDefault();
-      deleteSelectedComponent();
+      deleteSelection();
+      return;
+    }
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+      const selected = selectedElements().filter((element) => !element.locked);
+      if (!selected.length) return;
+      event.preventDefault();
+      pushHistory("arrow move");
+      const step = event.shiftKey ? 10 : event.altKey ? 1 : 5;
+      selected.forEach((element) => {
+        if (event.key === "ArrowUp") element.y -= step;
+        if (event.key === "ArrowDown") element.y += step;
+        if (event.key === "ArrowLeft") element.x -= step;
+        if (event.key === "ArrowRight") element.x += step;
+      });
+      markDirty(true);
     }
   });
 }
 
-async function registerServiceWorker(): Promise<void> {
-  if (!("serviceWorker" in navigator) || !import.meta.env.PROD) return;
-  const cleared = await clearLegacyServiceWorkerCaches();
-  if (cleared) setToast("Old app cache cleared. Reload once if the editor was already open.");
+async function boot(): Promise<void> {
+  bindKeyboard();
+  app.projects = await listProjects();
+  app.library = await listLibraryItems();
+  const storage = await getStorageStatus();
+  app.storageMessage = storage.message;
+  app.storageUsage = storage.estimate ? `${humanBytes(storage.estimate.usage)} / ${humanBytes(storage.estimate.quota)}` : "";
+  if (app.projects[0]) await openProject(app.projects[0].id);
+  else await createNew();
 }
 
-async function boot(): Promise<void> {
-  bindUnloadProtection();
-  bindEditorKeyboardShortcuts();
-  await refreshLocalState();
-  render();
-  await registerServiceWorker();
-}
+window.addEventListener("beforeunload", (event) => {
+  if (!app.dirty && !app.saving) return;
+  event.preventDefault();
+  event.returnValue = "";
+});
 
 void boot().catch((error) => {
-  root.innerHTML = `<main class="fatal-error"><h1>HTML Forge failed to start</h1><p>${escapeHtml(error instanceof Error ? error.message : String(error))}</p></main>`;
+  root.innerHTML = `<main class="fatal-error"><h1>Forge failed to start</h1><p>${escapeHtml(error instanceof Error ? error.message : String(error))}</p></main>`;
 });

@@ -6,6 +6,7 @@ export interface HtmlExportOptions {
   interactive: boolean;
   includeNotes?: boolean;
   includeReport?: boolean;
+  runtimeScriptUrl?: string;
 }
 
 function styleForPage(page: ForgePage): string {
@@ -72,7 +73,12 @@ function runtimeScript(data: ReturnType<typeof connectionRuntimeData>): string {
 })();`;
 }
 
-export function createPrototypeHtml(project: HtmlForgeProject, options: HtmlExportOptions = { interactive: true }): string {
+function runtimeMarkup(data: ReturnType<typeof connectionRuntimeData>, runtimeScriptUrl?: string): string {
+  if (!runtimeScriptUrl) return `<script>${runtimeScript(data)}</script>`;
+  return `<script type="application/json" id="forge-runtime-data">${safeJson(data)}</script><script src="${escapeAttribute(runtimeScriptUrl)}"></script>`;
+}
+
+export function createProductHtml(project: HtmlForgeProject, options: HtmlExportOptions = { interactive: true }): string {
   const connections = connectionRuntimeData(project);
   const css = project.pages.map(styleForPage).join("\n") + "\n" + project.overlays.map((overlay) => overlay.css).join("\n");
   const screens = project.pages
@@ -116,13 +122,13 @@ ${css}
 ${screens}
 ${overlays}
 ${notes}
-${options.interactive ? `<script>${runtimeScript(connections)}</script>` : ""}
+${options.interactive ? runtimeMarkup(connections, options.runtimeScriptUrl) : ""}
 </body>
 </html>`;
 }
 
 export function createStaticVisualHtml(project: HtmlForgeProject): string {
-  return createPrototypeHtml(project, { interactive: false });
+  return createProductHtml(project, { interactive: false });
 }
 
 export function createProjectJson(project: HtmlForgeProject): string {
@@ -161,7 +167,7 @@ export function exportProjectPackage(project: HtmlForgeProject, report?: ImportR
   const fileBase = `${slugify(project.name)}_${stamp}`;
   const entries: Record<string, Uint8Array> = {
     "project.htmlforge.json": strToU8(createProjectJson(project)),
-    "prototype.html": strToU8(createPrototypeHtml(project, { interactive: true })),
+    "product.html": strToU8(createProductHtml(project, { interactive: true })),
     "static-visual.html": strToU8(createStaticVisualHtml(project)),
     "THIRD_PARTY_NOTICES.md": strToU8("See the hosted HTML Forge repository for full dependency notices. Runtime export contains no imported scripts.\n")
   };
@@ -203,7 +209,7 @@ ${project.importSummary ?? "No import report attached."}
   const entries: Record<string, Uint8Array> = {
     "handoff.md": strToU8(markdown),
     "project.json": strToU8(createProjectJson(project)),
-    "prototype.html": strToU8(createPrototypeHtml(project, { interactive: true })),
+    "product.html": strToU8(createProductHtml(project, { interactive: true })),
     "static-visual.html": strToU8(createStaticVisualHtml(project))
   };
   if (report) entries["import-report.json"] = strToU8(JSON.stringify(report, null, 2));

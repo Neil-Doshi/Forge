@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createPrototypeHtml, exportProjectPackage } from "../src/exporter";
+import { createProductHtml, exportProjectPackage } from "../src/exporter";
 import { createBlankProject } from "../src/projectFactory";
 
 describe("exporter", () => {
@@ -7,7 +7,7 @@ describe("exporter", () => {
     const project = createBlankProject("</script><img src=x onerror=alert(1)>");
     project.pages[0].name = "Home <script>";
     project.notes.malicious = "</script><img src=x onerror=alert(1)>";
-    const html = createPrototypeHtml(project, { interactive: true, includeNotes: true });
+    const html = createProductHtml(project, { interactive: true, includeNotes: true });
     expect(html).toContain("hf-screen-0001");
     expect(html).not.toContain("</script><img");
     expect(html).toContain("\\u003c/script");
