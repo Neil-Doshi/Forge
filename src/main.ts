@@ -2,7 +2,7 @@ import "./styles.css";
 import { unzipSync, strFromU8 } from "fflate";
 import { analyzeHtmlImport, type ImportAnalysisResult } from "./analyzer";
 import { createPrototypeHtml, createProjectJson, createImportReportMarkdown, exportAiHandoff, exportProjectPackage } from "./exporter";
-import { mountGrapesEditor, type MountedEditor } from "./editor";
+import { mountGrapesEditor, type EditorSnapshot, type MountedEditor, type SelectedComponentSnapshot } from "./editor";
 import { createBlankProject } from "./projectFactory";
 import { migrateProject } from "./migrations";
 import { suggestLibraryItems } from "./library";
@@ -63,6 +63,14 @@ interface AppState {
   libraryFilter: "reusable" | "project" | "review";
   editorTab: "screens" | "layers" | "insert" | "warnings";
   inspectorTab: "content" | "style" | "layout" | "behavior" | "effects";
+  editorZoom: number;
+  editorLeftWidth: number;
+  editorRightWidth: number;
+  editorCanvasHeight: number;
+  focusCanvas: boolean;
+  activeEditorPageId?: string;
+  selectedComponent?: SelectedComponentSnapshot;
+  editorError?: string;
   dirty: boolean;
   saving: boolean;
   saveError?: string;
@@ -87,6 +95,11 @@ const state: AppState = {
   libraryFilter: "reusable",
   editorTab: "screens",
   inspectorTab: "content",
+  editorZoom: 90,
+  editorLeftWidth: 248,
+  editorRightWidth: 280,
+  editorCanvasHeight: 720,
+  focusCanvas: false,
   dirty: false,
   saving: false,
   lockMessage: "No project lock active."
@@ -94,7 +107,30 @@ const state: AppState = {
 
 let mountedEditor: MountedEditor | undefined;
 let mountedEditorProjectId: string | undefined;
+let mountedEditorSnapshotKey = "";
+let editorMountToken = 0;
 let activeLock: ProjectLockHandle | undefined;
+
+function icon(
+  name: "undo" | "redo" | "zoomIn" | "zoomOut" | "fit" | "save" | "preview" | "focus" | "trash" | "pages" | "toolbox" | "connections" | "inspector"
+): string {
+  const paths: Record<typeof name, string> = {
+    undo: '<path d="M9 7H4v5"/><path d="M4 12c2.2-4.4 8.5-6.2 13-2.7 2.8 2.2 3.7 6 2 9"/>',
+    redo: '<path d="M15 7h5v5"/><path d="M20 12c-2.2-4.4-8.5-6.2-13-2.7-2.8 2.2-3.7 6-2 9"/>',
+    zoomIn: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M10.5 7.5v6M7.5 10.5h6M15.5 15.5 21 21"/>',
+    zoomOut: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M7.5 10.5h6M15.5 15.5 21 21"/>',
+    fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/><path d="M9 4 4 9M15 4l5 5M9 20l-5-5M15 20l5-5"/>',
+    save: '<path d="M5 4h12l2 2v14H5z"/><path d="M8 4v6h8V4M8 20v-6h8v6"/>',
+    preview: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="3"/>',
+    focus: '<path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/>',
+    trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 14h10l1-14M9 7V4h6v3"/>',
+    pages: '<path d="M7 3h10l4 4v14H7z"/><path d="M17 3v5h5"/><path d="M3 7v14h4"/>',
+    toolbox: '<path d="M4 7h16v12H4z"/><path d="M8 7V5h8v2M4 12h16"/><path d="M12 12v3"/>',
+    connections: '<circle cx="6" cy="7" r="3"/><circle cx="18" cy="17" r="3"/><path d="M8.5 9.5 15.5 14.5"/>',
+    inspector: '<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>'
+  };
+  return `<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true">${paths[name]}</svg>`;
+}
 
 function setToast(message: string): void {
   state.toast = message;
@@ -107,10 +143,43 @@ function setToast(message: string): void {
   }, 3200);
 }
 
+function editorSnapshotKey(snapshot: EditorSnapshot): string {
+  return JSON.stringify(snapshot.pages.map((page) => ({ id: page.id, name: page.name, html: page.html, css: page.css })));
+}
+
+function syncProjectFromEditorSnapshot(snapshot: EditorSnapshot): void {
+  if (!state.project) return;
+  state.project.grapesProjectData = snapshot.grapesProjectData;
+  snapshot.pages.forEach((pageSnapshot, index) => {
+    const page = state.project?.pages[index];
+    if (!state.project || !page) return;
+    page.html = pageSnapshot.html;
+    page.css = pageSnapshot.css;
+    page.modifiedAt = nowIso();
+  });
+}
+
 function unmountEditor(): void {
-  mountedEditor?.destroy();
+  editorMountToken += 1;
+  try {
+    if (mountedEditor && state.project) {
+      const snapshot = mountedEditor.saveSnapshot();
+      const key = editorSnapshotKey(snapshot);
+      if (key !== mountedEditorSnapshotKey) {
+        const before = cloneProject(state.project);
+        syncProjectFromEditorSnapshot(snapshot);
+        mountedEditorSnapshotKey = key;
+        markDirty("Visual editor change", before);
+      }
+    }
+    mountedEditor?.destroy();
+  } catch (error) {
+    console.warn("Editor teardown recovered", error);
+  }
   mountedEditor = undefined;
   mountedEditorProjectId = undefined;
+  mountedEditorSnapshotKey = "";
+  state.selectedComponent = undefined;
 }
 
 function statusLabel(): string {
@@ -171,7 +240,7 @@ function routeMarkup(): string {
 }
 
 function render(): void {
-  if (state.route !== "editor") unmountEditor();
+  unmountEditor();
   root.innerHTML = `
     <div class="app-shell">
       <aside class="rail" aria-label="HTML Forge workspaces">
@@ -221,7 +290,7 @@ function render(): void {
     </div>
   `;
   bindEvents();
-  if (state.route === "editor") void mountEditorIfNeeded();
+  if (state.route === "editor" && !state.editorError) void mountEditorIfNeeded();
 }
 
 function homeView(): string {
@@ -287,23 +356,38 @@ function editorView(): string {
   if (!state.project) return noProjectView("Create or open a project to use the editor.");
   const tabs = ["screens", "layers", "insert", "warnings"] as const;
   const inspectors = ["content", "style", "layout", "behavior", "effects"] as const;
+  const activePageId = state.activeEditorPageId ?? state.project.pages[0]?.id;
+  const focusClass = state.focusCanvas ? `focus-canvas ${state.editorTab === "insert" ? "focus-toolbox" : ""}` : "";
   return `
-    <section class="editor-shell">
+    <section class="editor-shell ${focusClass}" style="--left-pane:${state.editorLeftWidth}px;--right-pane:${state.editorRightWidth}px;--canvas-height:${state.editorCanvasHeight}px">
       <div class="editor-toolbar" role="toolbar" aria-label="Editor controls">
         <label>Screen
           <select data-action="select-editor-page">
-            ${state.project.pages.map((page) => `<option value="${page.id}">${escapeHtml(page.name)}</option>`).join("")}
+            ${state.project.pages.map((page) => `<option value="${page.id}" ${page.id === activePageId ? "selected" : ""}>${escapeHtml(page.name)}</option>`).join("")}
           </select>
         </label>
-        <div class="segmented" aria-label="Device preview">
+        <div class="quick-command-bar" aria-label="Editing areas">
+          <button type="button" class="secondary-button compact ${state.editorTab === "screens" && !state.focusCanvas ? "is-active" : ""}" data-action="show-pages">${icon("pages")} Pages</button>
+          <button type="button" class="secondary-button compact ${state.editorTab === "insert" ? "is-active" : ""}" data-action="show-toolbox">${icon("toolbox")} Toolbox</button>
+          <button type="button" class="secondary-button compact" data-action="open-connections">${icon("connections")} Connections</button>
+          <button type="button" class="secondary-button compact ${!state.focusCanvas ? "is-active" : ""}" data-action="show-inspector">${icon("inspector")} Inspector</button>
+        </div>
+        <div class="segmented device-segment" aria-label="Device preview">
           <button type="button" aria-pressed="true">Desktop</button>
           <button type="button">Tablet</button>
           <button type="button">Phone</button>
         </div>
-        <button type="button" class="icon-button" title="Undo" aria-label="Undo" data-action="undo">U</button>
-        <button type="button" class="icon-button" title="Redo" aria-label="Redo" data-action="redo">R</button>
-        <button type="button" class="secondary-button compact" data-action="preview-project">Preview</button>
-        <button type="button" class="primary-button compact" data-action="save-now">Save</button>
+        <button type="button" class="icon-button" title="Undo (Ctrl+Z)" aria-label="Undo" data-action="undo">${icon("undo")}</button>
+        <button type="button" class="icon-button" title="Redo (Ctrl+Shift+Z)" aria-label="Redo" data-action="redo">${icon("redo")}</button>
+        <span class="toolbar-separator" aria-hidden="true"></span>
+        <button type="button" class="icon-button" title="Zoom out (Ctrl+-)" aria-label="Zoom out" data-action="zoom-out">${icon("zoomOut")}</button>
+        <span class="zoom-readout" data-zoom-readout>${state.editorZoom}%</span>
+        <button type="button" class="icon-button" title="Zoom in (Ctrl++)" aria-label="Zoom in" data-action="zoom-in">${icon("zoomIn")}</button>
+        <button type="button" class="icon-button" title="Fit canvas (Ctrl+0)" aria-label="Fit canvas" data-action="fit-canvas">${icon("fit")}</button>
+        <button type="button" class="secondary-button compact" title="Toggle full canvas" data-action="focus-canvas">${icon("focus")} ${state.focusCanvas ? "Show panels" : "Full canvas"}</button>
+        <span class="toolbar-separator" aria-hidden="true"></span>
+        <button type="button" class="secondary-button compact" data-action="preview-project">${icon("preview")} Preview</button>
+        <button type="button" class="primary-button compact" data-action="save-now">${icon("save")} Save</button>
       </div>
       <aside class="context-pane">
         <div class="tab-row">
@@ -311,9 +395,16 @@ function editorView(): string {
         </div>
         ${editorContextMarkup()}
       </aside>
+      <div class="pane-resizer left-resizer" data-resize-pane="left" role="separator" aria-label="Resize screen panel"></div>
       <section class="canvas-pane">
-        <div id="gjs-mount" class="gjs-mount"><div class="loading-panel">Loading visual editor...</div></div>
+        <div id="gjs-mount" class="gjs-mount">${
+          state.editorError
+            ? `<div class="editor-error-panel"><h3>Editor did not open</h3><p>${escapeHtml(state.editorError)}</p><button type="button" class="primary-button" data-action="retry-editor">Try again</button></div>`
+            : `<div class="loading-panel">Loading visual editor...</div>`
+        }</div>
+        <div class="canvas-height-resizer" data-resize-pane="canvas-height" role="separator" aria-label="Resize canvas height"></div>
       </section>
+      <div class="pane-resizer right-resizer" data-resize-pane="right" role="separator" aria-label="Resize inspector panel"></div>
       <aside class="inspector-pane">
         <div class="tab-row">
           ${inspectors.map((tab) => `<button type="button" class="${state.inspectorTab === tab ? "is-active" : ""}" data-inspector-tab="${tab}">${tab}</button>`).join("")}
@@ -327,11 +418,12 @@ function editorView(): string {
 function editorContextMarkup(): string {
   if (!state.project) return "";
   if (state.editorTab === "screens") {
+    const activePageId = state.activeEditorPageId ?? state.project.pages[0]?.id;
     return `
       <div class="list-stack">
         ${state.project.pages
           .map(
-            (page, index) => `<button type="button" class="screen-row" data-open-page="${page.id}">
+            (page, index) => `<button type="button" class="screen-row ${page.id === activePageId ? "is-active" : ""}" data-open-page="${page.id}">
               <span>${index + 1}</span><strong>${escapeHtml(page.name)}</strong><small>${page.componentCount} nodes</small>
             </button>`
           )
@@ -367,8 +459,12 @@ function inspectorMarkup(): string {
   if (!state.project) return "";
   if (state.inspectorTab === "content") {
     return `
+      <div data-selected-inspector>
+        ${selectedInspectorMarkup()}
+      </div>
+      <div class="inspector-divider"></div>
       <label>Project name <input type="text" value="${escapeAttribute(state.project.name)}" data-action="project-name"></label>
-      <label>Current notes <textarea rows="7" data-action="project-notes">${escapeHtml(state.project.notes.general ?? "")}</textarea></label>
+      <label>Project notes <textarea rows="5" data-action="project-notes">${escapeHtml(state.project.notes.general ?? "")}</textarea></label>
     `;
   }
   if (state.inspectorTab === "behavior") {
@@ -381,6 +477,183 @@ function inspectorMarkup(): string {
     return `<div class="token-list">${(state.report?.css.keyframes ?? []).map((item) => `<span>${escapeHtml(item)}</span>`).join("") || "<p class='muted'>No imported keyframes detected.</p>"}</div>`;
   }
   return `<p class="muted">Use GrapesJS controls in the canvas for ${escapeHtml(state.inspectorTab)} edits. HTML Forge saves editor data into the project model.</p>`;
+}
+
+function selectedInspectorMarkup(): string {
+  const selected = state.selectedComponent;
+  if (!selected) {
+    return `
+      <section class="selected-card empty-selection">
+        <h4>No element selected</h4>
+        <p>Click text, a button, a card, or any component on the canvas. The quick editor will appear here.</p>
+      </section>
+    `;
+  }
+  return `
+    <section class="selected-card">
+      <div class="panel-heading compact-heading">
+        <h4>${escapeHtml(selected.name || selected.tagName)}</h4>
+        <span>${escapeHtml(selected.tagName)}</span>
+      </div>
+      <label>Text <textarea rows="3" data-selected-prop="text">${escapeHtml(selected.text)}</textarea></label>
+      <div class="field-grid two">
+        <label>Width <input type="text" placeholder="auto" value="${escapeAttribute(selected.width)}" data-selected-prop="width"></label>
+        <label>Height <input type="text" placeholder="auto" value="${escapeAttribute(selected.height)}" data-selected-prop="height"></label>
+      </div>
+      <div class="field-grid two">
+        <label>Fill <input type="color" value="${normalizeColor(selected.background)}" data-selected-prop="background"></label>
+        <label>Text <input type="color" value="${normalizeColor(selected.color, "#1b2433")}" data-selected-prop="color"></label>
+      </div>
+      <div class="field-grid two">
+        <label>Padding <input type="text" placeholder="12px" value="${escapeAttribute(selected.padding)}" data-selected-prop="padding"></label>
+        <label>Radius <input type="text" placeholder="6px" value="${escapeAttribute(selected.radius)}" data-selected-prop="radius"></label>
+      </div>
+      <div class="button-row">
+        <button type="button" class="secondary-button compact" data-action="apply-selected-edit">Apply</button>
+        <button type="button" class="ghost-button compact danger" data-action="delete-selected">${icon("trash")} Delete</button>
+      </div>
+    </section>
+  `;
+}
+
+function normalizeColor(value: string, fallback = "#ffffff"): string {
+  if (/^#[0-9a-f]{6}$/i.test(value)) return value;
+  const match = value.match(/^rgb\(\s*(\d+),\s*(\d+),\s*(\d+)\s*\)$/i);
+  if (match) {
+    return `#${[match[1], match[2], match[3]].map((part) => Number(part).toString(16).padStart(2, "0")).join("")}`;
+  }
+  return fallback;
+}
+
+function selectEditorPage(pageId: string): void {
+  if (!state.project || !state.project.pages.some((page) => page.id === pageId)) return;
+  state.activeEditorPageId = pageId;
+  mountedEditor?.selectPage(pageId);
+  state.selectedComponent = undefined;
+  updateSelectedInspectorOnly();
+  root.querySelectorAll<HTMLButtonElement>("[data-open-page]").forEach((button) => {
+    button.classList.toggle("is-active", button.dataset.openPage === pageId);
+  });
+}
+
+function updateZoomReadout(): void {
+  root.querySelector("[data-zoom-readout]")?.replaceChildren(document.createTextNode(`${Math.round(state.editorZoom)}%`));
+}
+
+function zoomEditor(delta: number): void {
+  state.editorZoom = Math.round(mountedEditor?.zoomBy(delta) ?? Math.min(160, Math.max(25, state.editorZoom + delta)));
+  updateZoomReadout();
+}
+
+function fitEditorCanvas(): void {
+  state.editorZoom = Math.round(mountedEditor?.fitCanvas() ?? state.editorZoom);
+  updateZoomReadout();
+}
+
+function toggleFocusCanvas(): void {
+  state.focusCanvas = !state.focusCanvas;
+  if (state.focusCanvas) state.editorTab = "insert";
+  render();
+}
+
+function showPagesPanel(): void {
+  state.focusCanvas = false;
+  state.editorTab = "screens";
+  render();
+}
+
+function showToolboxPanel(): void {
+  state.editorTab = "insert";
+  render();
+}
+
+function showInspectorPanel(): void {
+  state.focusCanvas = false;
+  state.inspectorTab = "content";
+  render();
+}
+
+function applySelectedEdit(): void {
+  const selected = state.selectedComponent;
+  const read = (prop: keyof SelectedComponentSnapshot): string =>
+    root.querySelector<HTMLInputElement | HTMLTextAreaElement>(`[data-selected-prop="${prop}"]`)?.value.trim() ?? "";
+  const background = read("background");
+  const color = read("color");
+  const change: Partial<SelectedComponentSnapshot> = {
+    text: read("text"),
+    width: read("width"),
+    height: read("height"),
+    padding: read("padding"),
+    radius: read("radius")
+  };
+  if (selected?.background || background !== "#ffffff") change.background = background;
+  if (selected?.color || color !== "#1b2433") change.color = color;
+  mountedEditor?.updateSelected(change);
+  state.selectedComponent = mountedEditor?.getSelectedSnapshot();
+  updateSelectedInspectorOnly();
+}
+
+function deleteSelectedComponent(): void {
+  mountedEditor?.deleteSelected();
+  state.selectedComponent = undefined;
+  updateSelectedInspectorOnly();
+}
+
+function insertEditorBlock(block: string): void {
+  if (!mountedEditor) {
+    setToast("The editor is still opening. Try the toolbox again in a moment.");
+    return;
+  }
+  mountedEditor.insertBlock(block);
+  state.selectedComponent = mountedEditor.getSelectedSnapshot();
+  updateSelectedInspectorOnly();
+}
+
+function updateSelectedInspectorOnly(): void {
+  const target = root.querySelector<HTMLElement>("[data-selected-inspector]");
+  if (!target) return;
+  target.innerHTML = selectedInspectorMarkup();
+  target.querySelectorAll<HTMLElement>("[data-action]").forEach((element) => {
+    element.addEventListener("click", () => void handleAction(element.dataset.action ?? "", element));
+  });
+}
+
+function startPaneResize(kind: string, event: PointerEvent): void {
+  if (!["left", "right", "canvas-height"].includes(kind)) return;
+  const shell = root.querySelector<HTMLElement>(".editor-shell");
+  if (!shell) return;
+  event.preventDefault();
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const startLeft = state.editorLeftWidth;
+  const startRight = state.editorRightWidth;
+  const startHeight = state.editorCanvasHeight;
+  document.body.classList.add("is-resizing");
+
+  const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+  const onMove = (moveEvent: PointerEvent): void => {
+    if (kind === "left") {
+      state.editorLeftWidth = clamp(startLeft + moveEvent.clientX - startX, 176, 440);
+      shell.style.setProperty("--left-pane", `${state.editorLeftWidth}px`);
+    }
+    if (kind === "right") {
+      state.editorRightWidth = clamp(startRight - (moveEvent.clientX - startX), 220, 460);
+      shell.style.setProperty("--right-pane", `${state.editorRightWidth}px`);
+    }
+    if (kind === "canvas-height") {
+      state.editorCanvasHeight = clamp(startHeight + moveEvent.clientY - startY, 460, 1300);
+      shell.style.setProperty("--canvas-height", `${state.editorCanvasHeight}px`);
+    }
+    mountedEditor?.refreshCanvas();
+  };
+  const onEnd = (): void => {
+    document.body.classList.remove("is-resizing");
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onEnd);
+    mountedEditor?.refreshCanvas();
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onEnd, { once: true });
 }
 
 function connectionsView(): string {
@@ -589,9 +862,9 @@ function settingsView(): string {
         <p>No backend, cloud save, analytics, or runtime CDN scripts are used. GitHub Pages hosts the application files only.</p>
       </div>
       <div class="workspace-panel">
-        <div class="panel-heading"><h3>Offline Shell</h3><span>service worker</span></div>
-        <p>The app shell caches after first successful production load. Imported user documents are not cached by the service worker.</p>
-        <button type="button" class="secondary-button" data-action="check-update">Check for update</button>
+        <div class="panel-heading"><h3>Cache Repair</h3><span>browser shell</span></div>
+        <p>Clear old production shell caches if the editor ever appears stuck after an update. Local projects remain in browser storage.</p>
+        <button type="button" class="secondary-button" data-action="check-update">Clear cached shell</button>
       </div>
       <div class="workspace-panel">
         <div class="panel-heading"><h3>Decision History</h3><span>${state.decisions.length}</span></div>
@@ -723,6 +996,10 @@ function bindEvents(): void {
       element.addEventListener("change", () => updateProjectNotes(element.value));
       return;
     }
+    if (element instanceof HTMLSelectElement && action === "select-editor-page") {
+      element.addEventListener("change", () => selectEditorPage(element.value));
+      return;
+    }
     element.addEventListener("click", () => void handleAction(action ?? "", element));
   });
 
@@ -760,7 +1037,10 @@ function bindEvents(): void {
     button.addEventListener("click", () => markConnectionUnresolved(button.dataset.unresolve as string));
   });
   root.querySelectorAll<HTMLButtonElement>("[data-open-page]").forEach((button) => {
-    button.addEventListener("click", () => mountedEditor?.selectPage(button.dataset.openPage as string));
+    button.addEventListener("click", () => selectEditorPage(button.dataset.openPage as string));
+  });
+  root.querySelectorAll<HTMLElement>("[data-resize-pane]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => startPaneResize(handle.dataset.resizePane ?? "", event));
   });
   root.querySelectorAll<HTMLButtonElement>("[data-approve-library]").forEach((button) => {
     button.addEventListener("click", () => void approveLibrary(button.dataset.approveLibrary));
@@ -811,6 +1091,41 @@ async function handleAction(action: string, element: HTMLElement): Promise<void>
     case "redo":
       redo();
       break;
+    case "zoom-out":
+      zoomEditor(-10);
+      break;
+    case "zoom-in":
+      zoomEditor(10);
+      break;
+    case "fit-canvas":
+      fitEditorCanvas();
+      break;
+    case "focus-canvas":
+      toggleFocusCanvas();
+      break;
+    case "show-pages":
+      showPagesPanel();
+      break;
+    case "show-toolbox":
+      showToolboxPanel();
+      break;
+    case "show-inspector":
+      showInspectorPanel();
+      break;
+    case "open-connections":
+      state.route = "connections";
+      render();
+      break;
+    case "apply-selected-edit":
+      applySelectedEdit();
+      break;
+    case "delete-selected":
+      deleteSelectedComponent();
+      break;
+    case "retry-editor":
+      state.editorError = undefined;
+      render();
+      break;
     case "save-selection-library":
       await saveSelectionAsLibrary();
       break;
@@ -833,7 +1148,7 @@ async function handleAction(action: string, element: HTMLElement): Promise<void>
       await checkServiceWorkerUpdate();
       break;
     case "insert-block":
-      setToast(`Use the GrapesJS block manager to insert a ${element.dataset.block ?? "block"}.`);
+      insertEditorBlock(element.dataset.block ?? "section");
       break;
   }
 }
@@ -845,6 +1160,8 @@ async function createNewProject(): Promise<void> {
   state.project = project;
   state.report = undefined;
   state.route = "editor";
+  state.activeEditorPageId = project.pages[0]?.id;
+  state.editorError = undefined;
   await establishLock(project.id);
   render();
 }
@@ -858,6 +1175,8 @@ async function openProject(id: string): Promise<void> {
   state.project = project;
   state.report = project.importReportId ? await getImportReport(project.importReportId) : undefined;
   state.route = "editor";
+  state.activeEditorPageId = project.pages[0]?.id;
+  state.editorError = undefined;
   await establishLock(project.id);
   render();
 }
@@ -943,6 +1262,8 @@ async function acceptImport(): Promise<void> {
   state.report = report;
   state.importOpen = false;
   state.route = "editor";
+  state.activeEditorPageId = project.pages[0]?.id;
+  state.editorError = undefined;
   await establishLock(project.id);
   render();
 }
@@ -975,6 +1296,8 @@ async function importProjectFile(file?: File): Promise<void> {
   project.revision = 1;
   await putProject(project);
   state.projects = await listProjects();
+  state.activeEditorPageId = project.pages[0]?.id;
+  state.editorError = undefined;
   await openProject(project.id);
 }
 
@@ -984,26 +1307,46 @@ async function mountEditorIfNeeded(): Promise<void> {
   if (!mount) return;
   if (mountedEditor && mountedEditorProjectId === state.project.id) return;
   unmountEditor();
-  mountedEditorProjectId = state.project.id;
-  mountedEditor = await mountGrapesEditor(mount, state.project, {
-    onChange(snapshot) {
-      if (!state.project) return;
-      const before = cloneProject(state.project);
-      state.project.grapesProjectData = snapshot.grapesProjectData;
-      snapshot.pages.forEach((pageSnapshot, index) => {
-        const page = state.project?.pages[index];
-        if (!state.project || !page) return;
-        page.html = pageSnapshot.html;
-        page.css = pageSnapshot.css;
-        page.modifiedAt = nowIso();
-      });
-      markDirty("Visual editor change", before);
-    },
-    onError(error) {
-      state.saveError = `Editor failed: ${error.message}`;
-      render();
+  const mountToken = ++editorMountToken;
+  try {
+    const editor = await mountGrapesEditor(mount, state.project, {
+      onChange(snapshot) {
+        if (mountToken !== editorMountToken) return;
+        if (!state.project) return;
+        const before = cloneProject(state.project);
+        syncProjectFromEditorSnapshot(snapshot);
+        mountedEditorSnapshotKey = editorSnapshotKey(snapshot);
+        markDirty("Visual editor change", before);
+      },
+      onSelection(snapshot) {
+        if (mountToken !== editorMountToken) return;
+        state.selectedComponent = snapshot;
+        updateSelectedInspectorOnly();
+      },
+      onError(error) {
+        if (mountToken !== editorMountToken) return;
+        state.saveError = `Editor failed: ${error.message}`;
+        state.editorError = error.message;
+      }
+    });
+    if (mountToken !== editorMountToken || !mount.isConnected || state.route !== "editor" || state.editorError) {
+      editor.destroy();
+      return;
     }
-  });
+    mountedEditor = editor;
+    mountedEditorProjectId = state.project.id;
+    state.editorError = undefined;
+    state.editorZoom = Math.round(mountedEditor.setZoom(state.editorZoom));
+    mountedEditorSnapshotKey = editorSnapshotKey(mountedEditor.saveSnapshot());
+    updateZoomReadout();
+    selectEditorPage(state.activeEditorPageId ?? state.project.pages[0]?.id ?? "");
+  } catch (error) {
+    if (mountToken !== editorMountToken) return;
+    state.editorError = error instanceof Error ? error.message : String(error);
+    mountedEditor = undefined;
+    mountedEditorProjectId = undefined;
+    render();
+  }
 }
 
 function updateProjectName(value: string): void {
@@ -1044,7 +1387,7 @@ function addScreen(): void {
   if (!state.project) return;
   const before = cloneProject(state.project);
   const name = `Screen ${state.project.pages.length + 1}`;
-  state.project.pages.push({
+  const page = {
     id: createId("page"),
     generatedId: generatedScreenId(state.project.pages.length),
     name,
@@ -1055,8 +1398,11 @@ function addScreen(): void {
     componentCount: 3,
     createdAt: nowIso(),
     modifiedAt: nowIso()
-  });
-  mountedEditor?.addPage(name);
+  };
+  state.project.pages.push(page);
+  state.activeEditorPageId = page.id;
+  mountedEditor?.addPage(name, page.id);
+  mountedEditor?.selectPage(page.id);
   markDirty("Add screen", before);
   render();
 }
@@ -1221,14 +1567,28 @@ async function persistStorage(): Promise<void> {
   render();
 }
 
-async function checkServiceWorkerUpdate(): Promise<void> {
-  const registration = await navigator.serviceWorker?.getRegistration();
-  if (!registration) {
-    setToast("Service worker is available after a production build load.");
-    return;
+async function clearLegacyServiceWorkerCaches(): Promise<number> {
+  let cleared = 0;
+  if ("serviceWorker" in navigator) {
+    const registrations = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(
+      registrations.map(async (registration) => {
+        if (await registration.unregister()) cleared += 1;
+      })
+    );
   }
-  await registration.update();
-  setToast(registration.waiting ? "Update available. Reload the application." : "Application shell is current.");
+  if ("caches" in window) {
+    const keys = await caches.keys();
+    const forgeKeys = keys.filter((key) => key.startsWith("html-forge"));
+    await Promise.all(forgeKeys.map((key) => caches.delete(key)));
+    cleared += forgeKeys.length;
+  }
+  return cleared;
+}
+
+async function checkServiceWorkerUpdate(): Promise<void> {
+  const cleared = await clearLegacyServiceWorkerCaches();
+  setToast(cleared ? "Cached app shell cleared. Reload if the editor was already open." : "No cached app shell was found.");
 }
 
 async function refreshLocalState(): Promise<void> {
@@ -1255,19 +1615,73 @@ function bindUnloadProtection(): void {
   });
 }
 
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target.isContentEditable;
+}
+
+function bindEditorKeyboardShortcuts(): void {
+  window.addEventListener("keydown", (event) => {
+    if (state.route !== "editor" || state.previewOpen || state.importOpen) return;
+    const key = event.key.toLowerCase();
+    const commandKey = event.ctrlKey || event.metaKey;
+    if (commandKey && key === "s") {
+      event.preventDefault();
+      void saveNow();
+      return;
+    }
+    if (commandKey && (event.key === "+" || event.key === "=")) {
+      event.preventDefault();
+      zoomEditor(10);
+      return;
+    }
+    if (commandKey && event.key === "-") {
+      event.preventDefault();
+      zoomEditor(-10);
+      return;
+    }
+    if (commandKey && event.key === "0") {
+      event.preventDefault();
+      fitEditorCanvas();
+      return;
+    }
+    if (commandKey && key === "z" && event.shiftKey) {
+      event.preventDefault();
+      redo();
+      return;
+    }
+    if (commandKey && key === "z") {
+      event.preventDefault();
+      undo();
+      return;
+    }
+    if (commandKey && key === "y") {
+      event.preventDefault();
+      redo();
+      return;
+    }
+    if (isTypingTarget(event.target)) return;
+    if (key === "f") {
+      event.preventDefault();
+      toggleFocusCanvas();
+      return;
+    }
+    if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      deleteSelectedComponent();
+    }
+  });
+}
+
 async function registerServiceWorker(): Promise<void> {
   if (!("serviceWorker" in navigator) || !import.meta.env.PROD) return;
-  const registration = await navigator.serviceWorker.register(`${import.meta.env.BASE_URL}sw.js`);
-  registration.addEventListener("updatefound", () => {
-    const worker = registration.installing;
-    worker?.addEventListener("statechange", () => {
-      if (worker.state === "installed" && navigator.serviceWorker.controller) setToast("Update available. Reload the application.");
-    });
-  });
+  const cleared = await clearLegacyServiceWorkerCaches();
+  if (cleared) setToast("Old app cache cleared. Reload once if the editor was already open.");
 }
 
 async function boot(): Promise<void> {
   bindUnloadProtection();
+  bindEditorKeyboardShortcuts();
   await refreshLocalState();
   render();
   await registerServiceWorker();
