@@ -106,6 +106,9 @@ interface DragState {
 const MODEL_NOTE_KEY = "forgeEditorModel";
 const instanceId = createId("instance");
 const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
+const IMPORT_CANVAS_WIDTH = 1200;
+const IMPORT_CANVAS_HEIGHT = 800;
+const MAX_MEASURED_IMPORT_ELEMENTS = 180;
 
 const defaultFont = "Inter, Segoe UI, system-ui, sans-serif";
 const themes: Record<ThemeId, { label: string; bg: string; panel: string; canvas: string; text: string; accent: string; accent2: string; muted: string; line: string }> = {
@@ -353,6 +356,8 @@ const app = {
   redo: [] as ForgeDesignModel[]
 };
 
+let repairedStoredImport = false;
+
 function activePage(): ForgeDesignPage | undefined {
   return app.model?.pages.find((page) => page.id === app.model?.currentPageId) ?? app.model?.pages[0];
 }
@@ -456,7 +461,7 @@ function elementsFromHtml(html: string, css = ""): ForgeElement[] {
 
 type ImportedScreen = ImportAnalysisResult["report"]["screens"][number];
 
-function shouldPreserveImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): boolean {
+function shouldMeasureImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): boolean {
   return (
     result.report.screens.length > 6 ||
     result.report.stats.componentCount > 160 ||
@@ -478,39 +483,223 @@ function importedScreenSrcdoc(screen: ImportedScreen): string {
   return `<style>${css}</style>${screen.html}`;
 }
 
-function elementsFromImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): ForgeElement[] {
-  if (!shouldPreserveImportedScreen(screen, result)) return elementsFromHtml(screen.html, screen.css);
-  return [
-    makeElement("html", 0, 0, {
-      name: screen.name,
-      text: screen.name,
-      html: importedScreenSrcdoc(screen),
-      w: 1200,
-      h: 800,
-      fill: "transparent",
-      border: "transparent",
-      borderWidth: 0,
-      radius: 0,
-      shadow: "none",
-      z: 1
+function waitForFrameReady(frame: HTMLIFrameElement): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      window.setTimeout(resolve, 40);
+    };
+    frame.addEventListener("load", done, { once: true });
+    window.setTimeout(done, 650);
+  });
+}
+
+function cssPixel(value: string, fallback = 0): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function visibleText(node: Element): string {
+  return (node.textContent ?? "").replace(/\s+/g, " ").trim();
+}
+
+function ownVisibleText(node: Element): string {
+  const clone = node.cloneNode(true) as Element;
+  clone.querySelectorAll("script,style,svg").forEach((child) => child.remove());
+  return visibleText(clone);
+}
+
+function cssBackground(style: CSSStyleDeclaration): string {
+  if (style.backgroundImage && style.backgroundImage !== "none") return style.backgroundImage;
+  return style.backgroundColor || "transparent";
+}
+
+function hasVisiblePaint(style: CSSStyleDeclaration): boolean {
+  return (
+    Boolean(style.backgroundImage && style.backgroundImage !== "none") ||
+    !["transparent", "rgba(0, 0, 0, 0)"].includes(style.backgroundColor) ||
+    cssPixel(style.borderTopWidth) > 0 ||
+    Boolean(style.boxShadow && style.boxShadow !== "none")
+  );
+}
+
+function importedNodeType(node: HTMLElement, style: CSSStyleDeclaration, text: string): ElementType | undefined {
+  const tag = node.tagName.toLowerCase();
+  const className = node.className.toString().toLowerCase();
+  const role = node.getAttribute("role")?.toLowerCase();
+  const clickable = style.cursor === "pointer" || role === "button" || /\b(btn|button|item|pill|badge|tag|link|action)\b/.test(className);
+  if (tag === "input" || tag === "textarea" || tag === "select") return "input";
+  if (tag === "button" || tag === "a" || clickable) return text ? "button" : "shape";
+  if (/^h[1-6]$/.test(tag) || /\b(title|subtitle|label|meta|value|name|text)\b/.test(className)) return text ? "text" : undefined;
+  if (text && node.children.length === 0) return "text";
+  if (hasVisiblePaint(style)) return "frame";
+  return text && text.length <= 90 && node.children.length === 0 ? "text" : undefined;
+}
+
+function measuredElementName(node: HTMLElement, type: ElementType, text: string): string {
+  const identity = node.id || node.getAttribute("aria-label") || node.className.toString().split(/\s+/).find(Boolean) || text || type;
+  return identity.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 42) || type;
+}
+
+function shouldSkipMeasuredNode(node: HTMLElement, rect: DOMRect, style: CSSStyleDeclaration): boolean {
+  if (["script", "style", "meta", "link", "svg", "path"].includes(node.tagName.toLowerCase())) return true;
+  if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return true;
+  if (rect.width < 8 || rect.height < 8) return true;
+  if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= IMPORT_CANVAS_WIDTH || rect.top >= IMPORT_CANVAS_HEIGHT) return true;
+  const area = rect.width * rect.height;
+  const viewportArea = IMPORT_CANVAS_WIDTH * IMPORT_CANVAS_HEIGHT;
+  if (area > viewportArea * 0.92 && !["topbar", "sidebar"].includes(node.id)) return true;
+  return false;
+}
+
+function importElementImportance(type: ElementType | undefined, node: HTMLElement): number {
+  const className = node.className.toString().toLowerCase();
+  if (type === "button" || type === "input") return 6;
+  if (type === "text") return 5;
+  if (node.id === "topbar" || node.id === "sidebar") return 4;
+  if (/\b(card|hero|row|pill|item|header)\b/.test(className)) return 3;
+  if (type === "frame") return 2;
+  return 1;
+}
+
+async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promise<ForgeElement[]> {
+  const frame = document.createElement("iframe");
+  // The source has already been sanitized; this temporary frame must remain
+  // same-origin so Forge can read layout boxes and convert them into elements.
+  frame.style.cssText = `position:fixed;left:-20000px;top:0;width:${IMPORT_CANVAS_WIDTH}px;height:${IMPORT_CANVAS_HEIGHT}px;border:0;pointer-events:none;opacity:0;`;
+  frame.srcdoc = importedScreenSrcdoc(screen);
+  document.body.appendChild(frame);
+  await waitForFrameReady(frame);
+  const doc = frame.contentDocument;
+  if (!doc) {
+    frame.remove();
+    return [];
+  }
+  await doc.fonts?.ready.catch(() => undefined);
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
+  const selector = [
+    "#topbar",
+    "#sidebar",
+    "#logo",
+    "#search-wrap",
+    "#statusbar-right",
+    ".view-header",
+    ".resume-hero",
+    ".card",
+    ".stat-card",
+    ".project-pill",
+    ".item-row",
+    ".file-item",
+    ".agenda-item",
+    ".knowledge-row",
+    ".trash-item",
+    ".setting-row",
+    ".cnode",
+    ".btn",
+    ".tnav-btn",
+    ".sb-item",
+    ".tag",
+    ".type-badge",
+    ".sb-badge",
+    ".view-title",
+    ".view-subtitle",
+    ".card-title",
+    ".title",
+    ".meta",
+    ".label",
+    ".pname",
+    ".pmeta",
+    ".stat-value",
+    ".stat-label",
+    ".resume-project",
+    ".resume-action",
+    ".resume-meta",
+    "button",
+    "a",
+    "input",
+    "textarea",
+    "select",
+    "h1",
+    "h2",
+    "h3",
+    "h4"
+  ].join(",");
+
+  const seen = new Set<Element>();
+  const measured = Array.from(doc.body.querySelectorAll<HTMLElement>(selector))
+    .filter((node) => {
+      if (seen.has(node)) return false;
+      seen.add(node);
+      return true;
     })
-  ];
+    .map((node) => {
+      const style = doc.defaultView!.getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      const text = ownVisibleText(node);
+      const type = importedNodeType(node, style, text);
+      return { node, style, rect, text, type, area: rect.width * rect.height, importance: importElementImportance(type, node) };
+    })
+    .filter((item) => item.type && !shouldSkipMeasuredNode(item.node, item.rect, item.style))
+    .sort((a, b) => b.importance - a.importance || b.area - a.area)
+    .slice(0, MAX_MEASURED_IMPORT_ELEMENTS)
+    .sort((a, b) => b.area - a.area)
+    .map((item, index) => {
+      const type = item.type as ElementType;
+      const isText = type === "text";
+      const isFrame = type === "frame";
+      const rect = item.rect;
+      return makeElement(type, Math.max(0, Math.round(rect.left)), Math.max(0, Math.round(rect.top)), {
+        name: measuredElementName(item.node, type, item.text),
+        text: isFrame ? "" : item.text || item.node.getAttribute("placeholder") || measuredElementName(item.node, type, item.text),
+        w: Math.max(12, Math.round(Math.min(rect.width, IMPORT_CANVAS_WIDTH - Math.max(0, rect.left)))),
+        h: Math.max(12, Math.round(Math.min(rect.height, IMPORT_CANVAS_HEIGHT - Math.max(0, rect.top)))),
+        fill: isText ? "transparent" : cssBackground(item.style),
+        color: item.style.color || "#172033",
+        border: item.style.borderTopColor || "transparent",
+        borderWidth: isText ? 0 : Math.round(cssPixel(item.style.borderTopWidth)),
+        radius: Math.round(cssPixel(item.style.borderTopLeftRadius)),
+        font: Math.max(8, Math.round(cssPixel(item.style.fontSize, 15))),
+        fontFamily: item.style.fontFamily || defaultFont,
+        weight: Number.parseInt(item.style.fontWeight, 10) || (isText ? 700 : 600),
+        opacity: Math.round((Number.parseFloat(item.style.opacity || "1") || 1) * 100),
+        shadow: item.style.boxShadow === "none" ? "" : item.style.boxShadow,
+        z: index + 1
+      });
+    })
+    .map((element, index) => ({ ...element, z: index + 1 }));
+
+  frame.remove();
+  return measured;
+}
+
+async function elementsFromImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): Promise<ForgeElement[]> {
+  if (!shouldMeasureImportedScreen(screen, result)) return elementsFromHtml(screen.html, screen.css);
+  const measured = await measuredElementsFromImportedScreen(screen);
+  return measured.length ? measured : elementsFromHtml(screen.html, screen.css);
 }
 
 function shouldRepairStoredImport(project: HtmlForgeProject, model: ForgeDesignModel): boolean {
   if (!project.source?.rawText || !project.source.retained) return false;
   const names = model.pages.slice(0, 10).map((page) => page.name.toLowerCase());
   const layoutPages = names.filter((name) => ["topbar", "topnav", "shell", "sidebar", "main"].includes(name) || name === "div").length;
-  return layoutPages >= 3;
+  const preservedPages = model.pages.filter((page) => page.elements.length === 1 && page.elements[0]?.type === "html").length;
+  return layoutPages >= 3 || (model.pages.length > 2 && preservedPages >= Math.min(3, model.pages.length));
 }
 
-function modelFromProject(project: HtmlForgeProject): ForgeDesignModel {
+async function modelFromProject(project: HtmlForgeProject): Promise<ForgeDesignModel> {
+  repairedStoredImport = false;
   const stored = project.notes?.[MODEL_NOTE_KEY];
   if (stored) {
     try {
       const parsed = JSON.parse(stored) as ForgeDesignModel;
       if (parsed.version === 2 && Array.isArray(parsed.pages)) {
-        if (shouldRepairStoredImport(project, parsed)) return modelFromImport(analyzeHtmlImport(project.source!.rawText!, project.source!.fileName, true));
+        if (shouldRepairStoredImport(project, parsed)) {
+          repairedStoredImport = true;
+          return await modelFromImport(analyzeHtmlImport(project.source!.rawText!, project.source!.fileName, true));
+        }
         return parsed;
       }
     } catch {
@@ -553,7 +742,7 @@ function modelFromProject(project: HtmlForgeProject): ForgeDesignModel {
   };
 }
 
-function modelFromImport(result: ImportAnalysisResult): ForgeDesignModel {
+async function modelFromImport(result: ImportAnalysisResult): Promise<ForgeDesignModel> {
   const report = result.report;
   const screens = report.screens.length
     ? report.screens
@@ -567,25 +756,27 @@ function modelFromImport(result: ImportAnalysisResult): ForgeDesignModel {
           componentCount: report.stats.componentCount
         }
       ];
-  const pages: ForgeDesignPage[] = screens.map((screen, index) => ({
-    id: result.project.pages[index]?.id ?? createId("page"),
-    generatedId: generatedScreenId(index),
-    name: screen.name || `Screen ${index + 1}`,
-    slug: slugify(screen.name || `screen-${index + 1}`),
-    width: 1200,
-    height: 800,
-    background: "#ffffff",
-    elements: elementsFromImportedScreen(screen, result)
-  }));
+  const pages: ForgeDesignPage[] = await Promise.all(
+    screens.map(async (screen, index) => ({
+      id: result.project.pages[index]?.id ?? createId("page"),
+      generatedId: generatedScreenId(index),
+      name: screen.name || `Screen ${index + 1}`,
+      slug: slugify(screen.name || `screen-${index + 1}`),
+      width: 1200,
+      height: 800,
+      background: "#ffffff",
+      elements: await elementsFromImportedScreen(screen, result)
+    }))
+  );
   const templates = importedTemplates(report.sanitizedHtml);
-  const preservedScreenImport = pages.some((page) => page.elements.length === 1 && page.elements[0]?.type === "html");
+  const measuredScreenImport = pages.some((page) => page.elements.length > 24);
   const model: ForgeDesignModel = {
     version: 2,
     theme: "forge",
     currentPageId: pages[0].id,
     pages,
     templates,
-    zoom: preservedScreenImport ? 75 : 100,
+    zoom: measuredScreenImport ? 75 : 100,
     grid: true,
     snap: true,
     nextNumber: 100
@@ -2120,7 +2311,7 @@ function normalizeColor(value: string, fallback = "#ffffff"): string {
 async function createNew(): Promise<void> {
   const project = createBlankProject("Forge UI Project");
   app.project = project;
-  app.model = modelFromProject(project);
+  app.model = await modelFromProject(project);
   app.model.pages[0].elements = [
     makeElement("text", 86, 82, { text: "New interface", font: 48, w: 640, h: 92, z: 1 }),
     makeElement("card", 86, 190, { text: "Start from here\nAdd UI pieces from the Build panel, then save anything reusable.", w: 420, h: 180, z: 2 })
@@ -2141,7 +2332,13 @@ async function openProject(id: string): Promise<void> {
     return;
   }
   app.project = project;
-  app.model = modelFromProject(project);
+  app.model = await modelFromProject(project);
+  if (repairedStoredImport) {
+    syncProjectModel();
+    await putProject(app.project);
+    app.projects = await listProjects();
+    toast("Rebuilt imported HTML into editable layers.");
+  }
   app.selectedIds = [];
   app.history = [];
   app.redo = [];
@@ -2168,7 +2365,7 @@ async function acceptImport(): Promise<void> {
   if (!app.importDraft) return;
   const imported = app.importDraft.project;
   app.project = imported;
-  app.model = modelFromImport(app.importDraft);
+  app.model = await modelFromImport(app.importDraft);
   app.project.notes[MODEL_NOTE_KEY] = JSON.stringify(app.model);
   app.project.importReportId = app.importDraft.report.id;
   app.importDraft.report.projectId = app.project.id;
