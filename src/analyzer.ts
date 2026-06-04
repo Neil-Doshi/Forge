@@ -22,9 +22,32 @@ interface ScreenCandidate {
 function readableName(value: string): string {
   return value
     .replace(/^#|\./g, "")
+    .replace(/^(view|screen|page|route)[-_]+/i, "")
+    .replace(/[-_]+(view|screen|page|panel)$/i, "")
     .replace(/[-_]+/g, " ")
     .replace(/\b\w/g, (letter) => letter.toUpperCase())
     .trim();
+}
+
+function normalizedName(value = ""): string {
+  return value
+    .toLowerCase()
+    .replace(/^#|\./g, "")
+    .replace(/^(view|screen|page|route)[-_]+/i, "")
+    .replace(/[-_]+(view|screen|page|panel)$/i, "")
+    .replace(/[-_\s]+/g, " ")
+    .trim();
+}
+
+function nameAliases(...values: Array<string | undefined>): string[] {
+  return Array.from(
+    new Set(
+      values
+        .flatMap((value) => [value, slugify(value ?? ""), normalizedName(value)])
+        .map((value) => normalizedName(value))
+        .filter(Boolean)
+    )
+  );
 }
 
 function selectorFor(element: Element): string {
@@ -43,7 +66,67 @@ function countMeaningfulNodes(element: Element): number {
   }).length;
 }
 
+function isExplicitViewElement(element: Element): boolean {
+  const id = element.id.toLowerCase();
+  const classList = Array.from(element.classList).map((item) => item.toLowerCase());
+  return (
+    element.hasAttribute("data-view") ||
+    element.hasAttribute("data-page") ||
+    element.hasAttribute("data-page-id") ||
+    classList.includes("view") ||
+    /^view[-_]/.test(id)
+  );
+}
+
+function screenNameFor(element: Element): string {
+  const dataName = element.getAttribute("data-view") || element.getAttribute("data-page") || element.getAttribute("data-page-id") || "";
+  return readableName(dataName || element.id || element.getAttribute("aria-label") || element.querySelector("h1,h2,h3")?.textContent || element.tagName);
+}
+
+function documentOrder(a: Element, b: Element): number {
+  const position = a.compareDocumentPosition(b);
+  if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+  if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+  return 0;
+}
+
+function collectExplicitViewCandidates(doc: Document, switchTargets: Set<string>): ScreenCandidate[] {
+  const nodes = Array.from(doc.querySelectorAll("[data-view],[data-page],[data-page-id],.view[id],[id^='view-']"));
+  const candidates = nodes
+    .filter((element) => {
+      if (!isExplicitViewElement(element)) return false;
+      const label = `${element.id} ${Array.from(element.classList).join(" ")} ${element.getAttribute("aria-label") ?? ""}`;
+      if (OVERLAY_HINT.test(label)) return false;
+      const aliases = nameAliases(element.id, element.getAttribute("data-view") ?? undefined, element.getAttribute("data-page") ?? undefined, element.getAttribute("data-page-id") ?? undefined);
+      return (
+        element.hasAttribute("data-view") ||
+        element.hasAttribute("data-page") ||
+        element.hasAttribute("data-page-id") ||
+        switchTargets.size === 0 ||
+        aliases.some((alias) => switchTargets.has(alias)) ||
+        element.classList.contains("view")
+      );
+    })
+    .map((element) => {
+      const aliases = nameAliases(element.id, element.getAttribute("data-view") ?? undefined, element.getAttribute("data-page") ?? undefined, element.getAttribute("data-page-id") ?? undefined);
+      const matchesSwitchTarget = aliases.some((alias) => switchTargets.has(alias));
+      return {
+        name: screenNameFor(element),
+        selector: selectorFor(element),
+        element,
+        score: 20 + (matchesSwitchTarget ? 8 : 0) + Math.min(countMeaningfulNodes(element), 12)
+      };
+    })
+    .sort((a, b) => documentOrder(a.element, b.element));
+
+  return candidates.filter((candidate, index, list) => !list.slice(0, index).some((prior) => prior.element.contains(candidate.element)));
+}
+
 function collectScreenCandidates(doc: Document, switchTargets: Set<string>): ScreenCandidate[] {
+  const normalizedSwitchTargets = new Set([...switchTargets].map((target) => normalizedName(target)).filter(Boolean));
+  const explicitViews = collectExplicitViewCandidates(doc, normalizedSwitchTargets);
+  if (explicitViews.length > 1) return explicitViews.slice(0, 48);
+
   const candidates = new Map<Element, ScreenCandidate>();
   const selectors = [
     "[data-view]",
@@ -65,9 +148,8 @@ function collectScreenCandidates(doc: Document, switchTargets: Set<string>): Scr
     const textSize = (element.textContent ?? "").trim().length;
     const childCount = countMeaningfulNodes(element);
     const hasHint = SCREEN_HINT.test(`${id} ${dataName} ${classHint}`);
-    const matchesSwitchTarget = [...switchTargets].some((target) => {
-      const normalized = target.toLowerCase();
-      return [id, dataName, ...Array.from(element.classList)].some((value) => value.toLowerCase().includes(normalized));
+    const matchesSwitchTarget = [...normalizedSwitchTargets].some((target) => {
+      return nameAliases(id, dataName, ...Array.from(element.classList)).some((value) => value.includes(target) || target.includes(value));
     });
     let score = 0;
     if (hasHint) score += 5;
@@ -85,18 +167,38 @@ function collectScreenCandidates(doc: Document, switchTargets: Set<string>): Scr
     .filter((candidate, index, list) => {
       return !list.slice(0, index).some((prior) => prior.element.contains(candidate.element) && prior.score >= candidate.score + 2);
     });
-  const ranked = rankedByConfidence.sort((a, b) => {
-    const position = a.element.compareDocumentPosition(b.element);
-    if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
-    if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
-    return 0;
-  });
+  const ranked = rankedByConfidence.sort((a, b) => documentOrder(a.element, b.element));
 
   if (!ranked.length && doc.body) {
     ranked.push({ name: "Home", selector: "body", element: doc.body, score: 1 });
   }
 
   return ranked.slice(0, 48);
+}
+
+function sameScreenElement(a: Element, b: Element): boolean {
+  if (a === b) return true;
+  if (a.id && b.id) return a.id === b.id;
+  const aAliases = nameAliases(a.id, a.getAttribute("data-view") ?? undefined, a.getAttribute("data-page") ?? undefined, a.getAttribute("data-page-id") ?? undefined);
+  const bAliases = new Set(nameAliases(b.id, b.getAttribute("data-view") ?? undefined, b.getAttribute("data-page") ?? undefined, b.getAttribute("data-page-id") ?? undefined));
+  return aAliases.some((alias) => bAliases.has(alias));
+}
+
+function shouldSnapshotAppShell(doc: Document, screens: ScreenCandidate[]): boolean {
+  return screens.length > 1 && screens.every((screen) => isExplicitViewElement(screen.element)) && Boolean(doc.querySelector("#shell,#main,.view[id],[id^='view-']"));
+}
+
+function screenHtmlFor(screen: ScreenCandidate, doc: Document, snapshotShell: boolean): string {
+  if (!snapshotShell) return screen.element.outerHTML || screen.element.innerHTML;
+  const body = doc.body.cloneNode(true) as HTMLElement;
+  body.querySelectorAll(".view[id],[id^='view-'],[data-view],[data-page],[data-page-id]").forEach((candidate) => {
+    const active = sameScreenElement(candidate, screen.element);
+    candidate.classList.toggle("active", active);
+    candidate.classList.toggle("listening", active);
+    if (active) candidate.classList.remove("hidden");
+    else candidate.classList.remove("active", "listening");
+  });
+  return body.innerHTML;
 }
 
 function collectOverlayCandidates(doc: Document): ScreenCandidate[] {
@@ -133,7 +235,7 @@ function collectInteractions(rawHtml: string, doc: Document, availableNames: Set
       type: "switchView",
       sourceName: "Imported script",
       targetName,
-      status: availableNames.has(targetName.toLowerCase()) ? "mapped" : "missing-target",
+      status: availableNames.has(normalizedName(targetName)) ? "mapped" : "missing-target",
       snippet: snippetAround(rawHtml, match.index ?? 0)
     });
   }
@@ -147,7 +249,7 @@ function collectInteractions(rawHtml: string, doc: Document, availableNames: Set
       sourceName,
       targetName,
       selector: selectorFor(element),
-      status: targetName && availableNames.has(targetName.toLowerCase()) ? "mapped" : "missing-target",
+      status: targetName && availableNames.has(normalizedName(targetName)) ? "mapped" : "missing-target",
       snippet: element.outerHTML.slice(0, 240)
     });
   });
@@ -192,18 +294,12 @@ export function analyzeHtmlImport(rawHtml: string, fileName = "import.html", ret
   const safeDoc = parser.parseFromString(sanitized.previewHtml, "text/html");
   const switchTargets = collectSwitchTargets(rawHtml);
   const screens = collectScreenCandidates(safeDoc, switchTargets);
+  const snapshotShell = shouldSnapshotAppShell(safeDoc, screens);
   const overlays = collectOverlayCandidates(safeDoc);
   const availableNames = new Set<string>();
   screens.forEach((screen) => {
-    availableNames.add(screen.name.toLowerCase());
-    const slug = slugify(screen.name);
-    availableNames.add(slug.toLowerCase());
-    availableNames.add(slug.replace(/-(view|screen|page|panel)$/i, "").toLowerCase());
-    if (screen.element.id) availableNames.add(screen.element.id.toLowerCase());
-    if (screen.element.id) availableNames.add(screen.element.id.replace(/-(view|screen|page|panel)$/i, "").toLowerCase());
-    const dataView = screen.element.getAttribute("data-view") || screen.element.getAttribute("data-page") || screen.element.getAttribute("data-page-id");
-    if (dataView) availableNames.add(dataView.toLowerCase());
-    if (dataView) availableNames.add(dataView.replace(/-(view|screen|page|panel)$/i, "").toLowerCase());
+    const dataView = screen.element.getAttribute("data-view") || screen.element.getAttribute("data-page") || screen.element.getAttribute("data-page-id") || undefined;
+    nameAliases(screen.name, screen.element.id, dataView).forEach((alias) => availableNames.add(alias));
   });
 
   const interactions = collectInteractions(rawHtml, rawDoc, availableNames);
@@ -219,7 +315,7 @@ export function analyzeHtmlImport(rawHtml: string, fileName = "import.html", ret
     generatedId: generatedScreenId(index),
     name: screen.name,
     slug: slugify(screen.name),
-    html: screen.element.innerHTML || sanitized.html,
+    html: screenHtmlFor(screen, safeDoc, snapshotShell) || sanitized.html,
     css: pageCssFor(screen.selector, sanitized.css),
     notes: "",
     componentCount: countMeaningfulNodes(screen.element),
@@ -229,19 +325,11 @@ export function analyzeHtmlImport(rawHtml: string, fileName = "import.html", ret
 
   const pageByName = new Map<string, ForgePage>();
   pages.forEach((page, index) => {
-    pageByName.set(page.name.toLowerCase(), page);
-    pageByName.set(page.slug.toLowerCase(), page);
-    pageByName.set(page.slug.replace(/-(view|screen|page|panel)$/i, "").toLowerCase(), page);
+    nameAliases(page.name, page.slug).forEach((alias) => pageByName.set(alias, page));
     const sourceId = screens[index]?.element.id;
-    if (sourceId) {
-      pageByName.set(sourceId.toLowerCase(), page);
-      pageByName.set(sourceId.replace(/-(view|screen|page|panel)$/i, "").toLowerCase(), page);
-    }
+    if (sourceId) nameAliases(sourceId).forEach((alias) => pageByName.set(alias, page));
     const sourceData = screens[index]?.element.getAttribute("data-view") || screens[index]?.element.getAttribute("data-page") || screens[index]?.element.getAttribute("data-page-id");
-    if (sourceData) {
-      pageByName.set(sourceData.toLowerCase(), page);
-      pageByName.set(sourceData.replace(/-(view|screen|page|panel)$/i, "").toLowerCase(), page);
-    }
+    if (sourceData) nameAliases(sourceData).forEach((alias) => pageByName.set(alias, page));
   });
 
   const forgeOverlays: ForgeOverlay[] = overlays.map((overlay, index) => ({
@@ -253,7 +341,7 @@ export function analyzeHtmlImport(rawHtml: string, fileName = "import.html", ret
   }));
 
   const connections: ForgeConnection[] = interactions.map((interaction) => {
-    const target = interaction.targetName ? pageByName.get(interaction.targetName.toLowerCase()) : undefined;
+    const target = interaction.targetName ? pageByName.get(normalizedName(interaction.targetName)) : undefined;
     return {
       id: createId("connection"),
       sourcePageId: pages[0]?.id ?? "",
@@ -300,7 +388,7 @@ export function analyzeHtmlImport(rawHtml: string, fileName = "import.html", ret
       id: pages[index]?.id ?? createId("screen"),
       name: screen.name,
       selector: screen.selector,
-      html: screen.element.innerHTML,
+      html: screenHtmlFor(screen, safeDoc, snapshotShell),
       css: pageCssFor(screen.selector, sanitized.css),
       componentCount: countMeaningfulNodes(screen.element)
     })),

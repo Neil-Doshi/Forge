@@ -16,6 +16,28 @@ describe("analyzeHtmlImport", () => {
     expect(result.project.connections.some((connection) => connection.targetName === "details")).toBe(true);
   });
 
+  it("imports app-shell views without promoting layout containers to pages", () => {
+    const shellApp = `<!doctype html>
+      <html><head><style>
+        #shell{display:flex}.view{display:none}.view.listening,.view.active{display:block}
+      </style></head><body>
+        <div id="topbar"><button onclick="switchView('landing')">Home</button></div>
+        <div id="shell">
+          <div id="sidebar"><button onclick="switchView('settings')">Settings</button></div>
+          <div id="main">
+            <div class="view listening" id="view-landing"><h1>Landing</h1></div>
+            <div class="view" id="view-settings"><h1>Settings</h1></div>
+          </div>
+        </div>
+        <script>function switchView(name){document.getElementById('view-'+name).classList.add('active')}</script>
+      </body></html>`;
+    const result = analyzeHtmlImport(shellApp, "shell.html", true);
+    expect(result.project.pages.map((page) => page.name)).toEqual(["Landing", "Settings"]);
+    expect(result.project.pages[0].html).toContain('id="topbar"');
+    expect(result.project.pages[0].html).toContain('id="view-landing"');
+    expect(result.project.pages.map((page) => page.name)).not.toContain("Shell");
+  });
+
   it("detects the synthetic FOCUS acceptance shape", () => {
     const result = analyzeHtmlImport(focusLike, "synthetic-focus.html", true);
     expect(result.report.stats.screenCount).toBeGreaterThanOrEqual(11);

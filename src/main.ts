@@ -454,12 +454,65 @@ function elementsFromHtml(html: string, css = ""): ForgeElement[] {
   return elements.map((element, index) => ({ ...element, z: index + 1 }));
 }
 
+type ImportedScreen = ImportAnalysisResult["report"]["screens"][number];
+
+function shouldPreserveImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): boolean {
+  return (
+    result.report.screens.length > 6 ||
+    result.report.stats.componentCount > 160 ||
+    screen.componentCount > 24 ||
+    screen.html.length > 6000 ||
+    /id=["'](?:topbar|shell|sidebar|main)["']|class=["'][^"']*\bview\b/i.test(screen.html) ||
+    /#(?:topbar|shell|sidebar|main)\b|\.(?:view|tnav-btn|sb-item)\b/i.test(screen.css)
+  );
+}
+
+function importedScreenSrcdoc(screen: ImportedScreen): string {
+  const css = [
+    screen.css,
+    "html,body{width:100%;height:100%;margin:0;overflow:hidden}",
+    "body{min-height:100%;}"
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return `<style>${css}</style>${screen.html}`;
+}
+
+function elementsFromImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): ForgeElement[] {
+  if (!shouldPreserveImportedScreen(screen, result)) return elementsFromHtml(screen.html, screen.css);
+  return [
+    makeElement("html", 0, 0, {
+      name: screen.name,
+      text: screen.name,
+      html: importedScreenSrcdoc(screen),
+      w: 1200,
+      h: 800,
+      fill: "transparent",
+      border: "transparent",
+      borderWidth: 0,
+      radius: 0,
+      shadow: "none",
+      z: 1
+    })
+  ];
+}
+
+function shouldRepairStoredImport(project: HtmlForgeProject, model: ForgeDesignModel): boolean {
+  if (!project.source?.rawText || !project.source.retained) return false;
+  const names = model.pages.slice(0, 10).map((page) => page.name.toLowerCase());
+  const layoutPages = names.filter((name) => ["topbar", "topnav", "shell", "sidebar", "main"].includes(name) || name === "div").length;
+  return layoutPages >= 3;
+}
+
 function modelFromProject(project: HtmlForgeProject): ForgeDesignModel {
   const stored = project.notes?.[MODEL_NOTE_KEY];
   if (stored) {
     try {
       const parsed = JSON.parse(stored) as ForgeDesignModel;
-      if (parsed.version === 2 && Array.isArray(parsed.pages)) return parsed;
+      if (parsed.version === 2 && Array.isArray(parsed.pages)) {
+        if (shouldRepairStoredImport(project, parsed)) return modelFromImport(analyzeHtmlImport(project.source!.rawText!, project.source!.fileName, true));
+        return parsed;
+      }
     } catch {
       // Fall through and rebuild from project pages.
     }
@@ -522,16 +575,17 @@ function modelFromImport(result: ImportAnalysisResult): ForgeDesignModel {
     width: 1200,
     height: 800,
     background: "#ffffff",
-    elements: elementsFromHtml(screen.html, screen.css)
+    elements: elementsFromImportedScreen(screen, result)
   }));
   const templates = importedTemplates(report.sanitizedHtml);
+  const preservedScreenImport = pages.some((page) => page.elements.length === 1 && page.elements[0]?.type === "html");
   const model: ForgeDesignModel = {
     version: 2,
     theme: "forge",
     currentPageId: pages[0].id,
     pages,
     templates,
-    zoom: 100,
+    zoom: preservedScreenImport ? 75 : 100,
     grid: true,
     snap: true,
     nextNumber: 100
@@ -1095,7 +1149,10 @@ function canvasMarkup(): string {
 function elementMarkup(element: ForgeElement): string {
   const selected = app.selectedIds.includes(element.id);
   const contentEditable = selected && ["text", "button", "card"].includes(element.type) && !element.locked;
-  const content = element.type === "html" ? element.html : compileElementContent(element);
+  const content =
+    element.type === "html"
+      ? `<iframe class="html-preview-frame" title="${escapeAttribute(element.name)} preview" sandbox="" srcdoc="${escapeAttribute(element.html)}"></iframe>`
+      : compileElementContent(element);
   const classes = ["canvas-element", `type-${element.type}`, selected ? "is-selected" : "", element.locked ? "is-locked" : "", element.hidden ? "is-hidden" : ""].filter(Boolean).join(" ");
   const style = elementStyle(element);
   return `

@@ -749,6 +749,23 @@ textarea {
   object-fit: cover;
 }
 
+.type-html .element-content {
+  align-items: stretch;
+  justify-content: stretch;
+  overflow: hidden;
+  padding: 0;
+  white-space: normal;
+}
+
+.html-preview-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: white;
+  pointer-events: none;
+}
+
 .type-input .element-content::after {
   content: "";
   position: absolute;
