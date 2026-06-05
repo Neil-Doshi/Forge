@@ -188,15 +188,64 @@ function shouldSnapshotAppShell(doc: Document, screens: ScreenCandidate[]): bool
   return screens.length > 1 && screens.every((screen) => isExplicitViewElement(screen.element)) && Boolean(doc.querySelector("#shell,#main,.view[id],[id^='view-']"));
 }
 
+function screenAliasSet(screen: ScreenCandidate): Set<string> {
+  const element = screen.element;
+  return new Set(
+    nameAliases(
+      screen.name,
+      element.id,
+      element.getAttribute("data-view") ?? undefined,
+      element.getAttribute("data-page") ?? undefined,
+      element.getAttribute("data-page-id") ?? undefined
+    )
+  );
+}
+
+function switchTargetFor(element: Element): string | undefined {
+  const directTarget =
+    element.getAttribute("data-view") ||
+    element.getAttribute("data-page") ||
+    element.getAttribute("data-page-id") ||
+    element.getAttribute("data-target") ||
+    element.getAttribute("href")?.replace(/^#/, "");
+  if (directTarget) return directTarget;
+
+  const onclick = element.getAttribute("onclick") ?? "";
+  const match = /switchView\s*\(\s*['"]([^'"]+)['"]\s*\)/i.exec(onclick);
+  return match?.[1];
+}
+
+function navigationAliasesFor(element: Element): string[] {
+  const text = element.textContent?.trim() ?? "";
+  return nameAliases(
+    switchTargetFor(element),
+    element.id,
+    element.getAttribute("aria-label") ?? undefined,
+    text.length <= 80 ? text : undefined
+  );
+}
+
+function matchesScreenAlias(element: Element, aliases: Set<string>): boolean {
+  const navAliases = navigationAliasesFor(element);
+  if (aliases.has("landing") && navAliases.includes("home")) return true;
+  return navAliases.some((alias) => aliases.has(alias) || [...aliases].some((target) => alias.length > 3 && (target.includes(alias) || alias.includes(target))));
+}
+
 function screenHtmlFor(screen: ScreenCandidate, doc: Document, snapshotShell: boolean): string {
   if (!snapshotShell) return screen.element.outerHTML || screen.element.innerHTML;
   const body = doc.body.cloneNode(true) as HTMLElement;
+  const aliases = screenAliasSet(screen);
   body.querySelectorAll(".view[id],[id^='view-'],[data-view],[data-page],[data-page-id]").forEach((candidate) => {
     const active = sameScreenElement(candidate, screen.element);
     candidate.classList.toggle("active", active);
     candidate.classList.toggle("listening", active);
     if (active) candidate.classList.remove("hidden");
     else candidate.classList.remove("active", "listening");
+  });
+  body.querySelectorAll(".tnav-btn,.sb-item,.nav-item,.nav-link,.tab,[role='tab'],[data-nav],nav [onclick*='switchView'],header [onclick*='switchView'],aside [onclick*='switchView']").forEach((candidate) => {
+    const active = matchesScreenAlias(candidate, aliases);
+    candidate.classList.toggle("active", active);
+    candidate.classList.toggle("listening", active);
   });
   return body.innerHTML;
 }

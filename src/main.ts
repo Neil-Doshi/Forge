@@ -121,6 +121,8 @@ const instanceId = createId("instance");
 const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
 const DEFAULT_CANVAS_WIDTH = 1200;
 const DEFAULT_CANVAS_HEIGHT = 800;
+const DESKTOP_APP_IMPORT_WIDTH = 1920;
+const DESKTOP_APP_IMPORT_HEIGHT = 960;
 const MIN_IMPORT_WIDTH = 320;
 const MIN_IMPORT_HEIGHT = 240;
 const MAX_IMPORT_WIDTH = 4096;
@@ -562,8 +564,11 @@ function inferImportedViewport(screen: ImportedScreen): ImportViewport {
   const inlineShell = screen.html.match(/<(?:main|div|section)[^>]+(?:id=["'](?:app|shell|main|root)["']|class=["'][^"']*(?:app|shell|screen|display)[^"']*["'])[^>]+style=["']([^"']+)["']/i)?.[1] ?? "";
   const explicitWidth = largestCssDimension(inlineShell, ["width"], MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH);
   const explicitHeight = largestCssDimension(inlineShell, ["height"], MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT);
-  const viewportWidth = clampNumber(Math.round(window.innerWidth || DEFAULT_CANVAS_WIDTH), MIN_IMPORT_WIDTH, 1920);
-  const viewportHeight = clampNumber(Math.round(window.innerHeight || DEFAULT_CANVAS_HEIGHT), MIN_IMPORT_HEIGHT, 1080);
+  const fullScreenApp = /id=["'](?:app|shell|topbar|sidebar|main)["']|class=["'][^"']*\b(?:view|view-body|view-header|tnav-btn|sb-item)\b/i.test(`${screen.html}\n${screen.css}`);
+  const fallbackWidth = fullScreenApp ? DESKTOP_APP_IMPORT_WIDTH : Math.round(window.innerWidth || DEFAULT_CANVAS_WIDTH);
+  const fallbackHeight = fullScreenApp ? DESKTOP_APP_IMPORT_HEIGHT : Math.round(window.innerHeight || DEFAULT_CANVAS_HEIGHT);
+  const viewportWidth = clampNumber(fallbackWidth, MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH);
+  const viewportHeight = clampNumber(fallbackHeight, MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT);
   return {
     width: explicitWidth ?? viewportWidth,
     height: explicitHeight ?? viewportHeight
@@ -609,9 +614,26 @@ function ownVisibleText(node: Element): string {
   return visibleText(clone);
 }
 
+function directVisibleText(node: Element): string {
+  return Array.from(node.childNodes)
+    .filter((child) => child.nodeType === Node.TEXT_NODE)
+    .map((child) => child.textContent ?? "")
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function cssBackground(style: CSSStyleDeclaration): string {
-  if (style.backgroundImage && style.backgroundImage !== "none") return style.backgroundImage;
-  return style.backgroundColor || "transparent";
+  const image = style.backgroundImage && style.backgroundImage !== "none" ? style.backgroundImage : "";
+  const color = style.backgroundColor && !["transparent", "rgba(0, 0, 0, 0)"].includes(style.backgroundColor) ? style.backgroundColor : "";
+  if (image && color) return `${image}, ${color}`;
+  if (image) return image;
+  return color || "transparent";
+}
+
+function pageBackground(style: CSSStyleDeclaration, fallback: string): string {
+  const background = cssBackground(style);
+  return background === "transparent" ? fallback : background;
 }
 
 function hasVisiblePaint(style: CSSStyleDeclaration): boolean {
@@ -627,13 +649,27 @@ function importedNodeType(node: HTMLElement, style: CSSStyleDeclaration, text: s
   const tag = node.tagName.toLowerCase();
   const className = node.className.toString().toLowerCase();
   const role = node.getAttribute("role")?.toLowerCase();
+  const containerLike = /\b(card|row|item-row|project-pill|knowledge-row|file-item|agenda-item|trash-item|setting-row|stat-card|view-header|resume-hero|card-mode-block|cnode|cboard-toolbar)\b/.test(className);
   const clickable = style.cursor === "pointer" || role === "button" || /\b(btn|button|item|pill|badge|tag|link|action)\b/.test(className);
   if (tag === "input" || tag === "textarea" || tag === "select") return "input";
+  if (containerLike && node.children.length > 0) return hasVisiblePaint(style) ? "frame" : undefined;
   if (tag === "button" || tag === "a" || clickable) return text ? "button" : "shape";
   if (/^h[1-6]$/.test(tag) || /\b(title|subtitle|label|meta|value|name|text)\b/.test(className)) return text ? "text" : undefined;
   if (text && node.children.length === 0) return "text";
   if (hasVisiblePaint(style)) return "frame";
   return text && text.length <= 90 && node.children.length === 0 ? "text" : undefined;
+}
+
+function importedElementText(node: HTMLElement, type: ElementType, text: string): string {
+  const tag = node.tagName.toLowerCase();
+  const className = node.className.toString().toLowerCase();
+  if (type === "input") return node.getAttribute("placeholder") || text || measuredElementName(node, type, text);
+  if (type === "text") return text || measuredElementName(node, type, text);
+  if (node.id === "logo") return text || measuredElementName(node, type, text);
+  if (type === "button" && (tag === "button" || tag === "a" || node.children.length === 0 || /\b(tnav-btn|sb-item|cb-btn)\b/.test(className))) {
+    return directVisibleText(node) || text || measuredElementName(node, type, text);
+  }
+  return "";
 }
 
 function measuredElementName(node: HTMLElement, type: ElementType, text: string): string {
@@ -657,7 +693,8 @@ function importElementImportance(type: ElementType | undefined, node: HTMLElemen
   if (type === "button" || type === "input") return 6;
   if (type === "text") return 5;
   if (node.id === "topbar" || node.id === "sidebar") return 4;
-  if (/\b(card|hero|row|pill|item|header)\b/.test(className)) return 3;
+  if (node.id === "caseboard-canvas") return 4;
+  if (/\b(card|hero|row|pill|item|header|cnode|cmb|cb-btn|cboard)\b/.test(className)) return 3;
   if (type === "frame") return 2;
   return 1;
 }
@@ -700,6 +737,7 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
     ".view-header",
     ".resume-hero",
     ".card",
+    ".card-mode-block",
     ".stat-card",
     ".project-pill",
     ".item-row",
@@ -708,7 +746,16 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
     ".knowledge-row",
     ".trash-item",
     ".setting-row",
+    "#caseboard-canvas",
+    ".cboard-toolbar",
     ".cnode",
+    ".cnode-type",
+    ".cnode-title",
+    ".cnode-body",
+    ".cnode-footer",
+    ".cb-btn",
+    ".cmb-label",
+    ".cmb-content",
     ".btn",
     ".tnav-btn",
     ".sb-item",
@@ -767,9 +814,10 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
       const isText = type === "text";
       const isFrame = type === "frame";
       const rect = item.rect;
+      const elementText = importedElementText(item.node, type, item.text);
       const element = makeElement(type, Math.max(0, Math.round(rect.left)), Math.max(0, Math.round(rect.top)), {
         name: measuredElementName(item.node, type, item.text),
-        text: isFrame ? "" : item.text || item.node.getAttribute("placeholder") || measuredElementName(item.node, type, item.text),
+        text: elementText,
         w: Math.max(12, Math.round(Math.min(rect.width, viewport.width - Math.max(0, rect.left)))),
         h: Math.max(12, Math.round(Math.min(rect.height, viewport.height - Math.max(0, rect.top)))),
         fill: isText ? "transparent" : cssBackground(item.style),
@@ -804,7 +852,7 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
 
   const bodyStyle = doc.defaultView!.getComputedStyle(doc.body);
   const htmlStyle = doc.defaultView!.getComputedStyle(doc.documentElement);
-  const background = normalizeColor(bodyStyle.backgroundColor, normalizeColor(htmlStyle.backgroundColor, "#ffffff"));
+  const background = pageBackground(bodyStyle, pageBackground(htmlStyle, "#ffffff"));
 
   frame.remove();
   return { width: viewport.width, height: viewport.height, background, elements: measured };
