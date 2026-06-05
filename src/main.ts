@@ -873,7 +873,9 @@ function shouldRepairStoredImport(project: HtmlForgeProject, model: ForgeDesignM
   const layoutPages = names.filter((name) => ["topbar", "topnav", "shell", "sidebar", "main"].includes(name) || name === "div").length;
   const preservedPages = model.pages.filter((page) => page.elements.length === 1 && page.elements[0]?.type === "html").length;
   const inflatedResponsiveImport = model.pages.some((page) => page.width === 1320 || page.height >= 1800);
-  return inflatedResponsiveImport || layoutPages >= 3 || (model.pages.length > 2 && preservedPages >= Math.min(3, model.pages.length));
+  const sourceHasSpecialViews = /\b(card-mode-block|caseboard-canvas|cboard-toolbar|cnode)\b/i.test(project.source.rawText);
+  const hasSpecialLayers = model.pages.some((page) => page.elements.some((element) => /\b(card-mode-block|caseboard-canvas|cboard-toolbar|cnode)\b/i.test(element.sourcePath ?? "")));
+  return inflatedResponsiveImport || layoutPages >= 3 || (model.pages.length > 2 && preservedPages >= Math.min(3, model.pages.length)) || (sourceHasSpecialViews && !hasSpecialLayers);
 }
 
 async function modelFromProject(project: HtmlForgeProject): Promise<ForgeDesignModel> {
