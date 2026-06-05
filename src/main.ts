@@ -23,8 +23,10 @@ const rootElement = document.querySelector<HTMLDivElement>("#app");
 if (!rootElement) throw new Error("HTML Forge root element is missing.");
 const root: HTMLDivElement = rootElement;
 
-type PanelId = "pages" | "components" | "reuse" | "assets" | "themes" | "import";
+type PanelId = "pages" | "reuse" | "assets" | "themes" | "import";
 type InspectorTab = "design" | "layout" | "actions" | "canvas";
+type UtilityTab = "toolbox" | "objects" | "properties";
+type PropertyTab = "properties" | "connections";
 type ToolId = "select" | "hand" | "text" | "frame";
 type ElementType = "frame" | "text" | "button" | "input" | "card" | "image" | "shape" | "html";
 type ThemeId = "forge" | "slate" | "light" | "terminal";
@@ -56,6 +58,9 @@ interface ForgeElement {
   target: string;
   assetId?: string;
   assetData?: string;
+  parentId?: string;
+  sourceTag?: string;
+  sourcePath?: string;
   z: number;
 }
 
@@ -84,6 +89,8 @@ interface ForgeDesignModel {
   pages: ForgeDesignPage[];
   templates: ForgeTemplate[];
   zoom: number;
+  panX: number;
+  panY: number;
   grid: boolean;
   snap: boolean;
   nextNumber: number;
@@ -97,17 +104,27 @@ interface DragState {
   startClientY: number;
   startCanvasX: number;
   startCanvasY: number;
-  startScrollX?: number;
-  startScrollY?: number;
+  startPanX?: number;
+  startPanY?: number;
   originals: Array<{ id: string; x: number; y: number; w: number; h: number }>;
   ratio?: number;
+}
+
+interface PanelResizeState {
+  side: "left" | "right";
+  startClientX: number;
+  startWidth: number;
 }
 
 const MODEL_NOTE_KEY = "forgeEditorModel";
 const instanceId = createId("instance");
 const MAX_IMAGE_BYTES = 1.5 * 1024 * 1024;
-const IMPORT_CANVAS_WIDTH = 1200;
-const IMPORT_CANVAS_HEIGHT = 800;
+const DEFAULT_CANVAS_WIDTH = 1200;
+const DEFAULT_CANVAS_HEIGHT = 800;
+const MIN_IMPORT_WIDTH = 320;
+const MIN_IMPORT_HEIGHT = 240;
+const MAX_IMPORT_WIDTH = 4096;
+const MAX_IMPORT_HEIGHT = 2160;
 const MAX_MEASURED_IMPORT_ELEMENTS = 180;
 
 const defaultFont = "Inter, Segoe UI, system-ui, sans-serif";
@@ -319,7 +336,24 @@ const iconPaths = {
   import: '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M5 21h14"/>',
   collapse: '<path d="m15 6-6 6 6 6"/>',
   expand: '<path d="m9 6 6 6-6 6"/>',
-  layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>'
+  layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>',
+  folder: '<path d="M3 6h7l2 2h9v13H3z"/>',
+  file: '<path d="M7 3h9l5 5v13H7z"/><path d="M16 3v6h6"/>',
+  eye: '<path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="m3 3 18 18"/><path d="M10.6 10.6a3 3 0 0 0 3.8 3.8"/><path d="M9.9 5.2A10.7 10.7 0 0 1 12 5c6 0 9.5 7 9.5 7a17.8 17.8 0 0 1-2.2 3.2"/><path d="M6.4 6.8C3.8 8.6 2.5 12 2.5 12s3.5 7 9.5 7c1.4 0 2.7-.3 3.8-.8"/>',
+  lock: '<path d="M7 11V8a5 5 0 0 1 10 0v3"/><path d="M5 11h14v10H5z"/>',
+  unlock: '<path d="M7 11V8a5 5 0 0 1 9.5-2.2"/><path d="M5 11h14v10H5z"/>',
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
+  chevronRight: '<path d="m9 6 6 6-6 6"/>',
+  rectangle: '<path d="M4 6h16v12H4z"/>',
+  ellipse: '<ellipse cx="12" cy="12" rx="8" ry="5"/>',
+  line: '<path d="M5 19 19 5"/>',
+  polygon: '<path d="m12 3 9 7-4 11H7L3 10z"/>',
+  buttonIcon: '<rect x="5" y="7" width="14" height="10" rx="2"/><path d="M8 12h8"/>',
+  nav: '<path d="M4 5h16M4 12h12M4 19h8"/><path d="m17 15 4 4-4 4"/>',
+  gauge: '<path d="M4 14a8 8 0 0 1 16 0"/><path d="m12 14 4-4"/><path d="M6 18h12"/>',
+  indicator: '<circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>',
+  search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/>'
 } as const;
 
 function icon(name: keyof typeof iconPaths): string {
@@ -331,13 +365,19 @@ const app = {
   library: [] as LibraryItem[],
   project: undefined as HtmlForgeProject | undefined,
   model: undefined as ForgeDesignModel | undefined,
-  activePanel: "components" as PanelId,
+  activePanel: "pages" as PanelId,
   inspectorTab: "design" as InspectorTab,
+  utilityTab: "objects" as UtilityTab,
+  propertyTab: "properties" as PropertyTab,
   activeTool: "select" as ToolId,
   selectedIds: [] as string[],
+  collapsedObjectIds: new Set<string>(),
+  highlightObjects: true,
   leftCollapsed: false,
   rightCollapsed: false,
   topCollapsed: false,
+  leftWidth: 322,
+  rightWidth: 330,
   previewOpen: false,
   previewHtml: "",
   importOpen: false,
@@ -352,6 +392,7 @@ const app = {
   saveError: "",
   toast: "",
   drag: undefined as DragState | undefined,
+  panelResize: undefined as PanelResizeState | undefined,
   history: [] as ForgeDesignModel[],
   redo: [] as ForgeDesignModel[]
 };
@@ -374,6 +415,27 @@ function selectedElement(): ForgeElement | undefined {
 
 function cloneModel(model: ForgeDesignModel): ForgeDesignModel {
   return structuredClone(model);
+}
+
+function normalizeDesignModel(model: ForgeDesignModel): ForgeDesignModel {
+  model.zoom = Number.isFinite(model.zoom) ? model.zoom : 100;
+  model.panX = Number.isFinite(model.panX) ? model.panX : 0;
+  model.panY = Number.isFinite(model.panY) ? model.panY : 0;
+  model.grid = model.grid ?? true;
+  model.snap = model.snap ?? true;
+  model.nextNumber = Number.isFinite(model.nextNumber) ? model.nextNumber : 20;
+  model.pages.forEach((page) => {
+    page.width = Number.isFinite(page.width) ? page.width : DEFAULT_CANVAS_WIDTH;
+    page.height = Number.isFinite(page.height) ? page.height : DEFAULT_CANVAS_HEIGHT;
+    page.background ||= "#ffffff";
+    page.elements.forEach((element, index) => {
+      element.z = Number.isFinite(element.z) ? element.z : index + 1;
+      element.parentId = element.parentId || undefined;
+      element.sourceTag = element.sourceTag || undefined;
+      element.sourcePath = element.sourcePath || undefined;
+    });
+  });
+  return model;
 }
 
 function snap(value: number): number {
@@ -461,6 +523,18 @@ function elementsFromHtml(html: string, css = ""): ForgeElement[] {
 
 type ImportedScreen = ImportAnalysisResult["report"]["screens"][number];
 
+interface ImportViewport {
+  width: number;
+  height: number;
+}
+
+interface MeasuredImport {
+  width: number;
+  height: number;
+  background: string;
+  elements: ForgeElement[];
+}
+
 function shouldMeasureImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): boolean {
   return (
     result.report.screens.length > 6 ||
@@ -470,6 +544,30 @@ function shouldMeasureImportedScreen(screen: ImportedScreen, result: ImportAnaly
     /id=["'](?:topbar|shell|sidebar|main)["']|class=["'][^"']*\bview\b/i.test(screen.html) ||
     /#(?:topbar|shell|sidebar|main)\b|\.(?:view|tnav-btn|sb-item)\b/i.test(screen.css)
   );
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function largestCssDimension(source: string, properties: string[], min: number, max: number): number | undefined {
+  const pattern = new RegExp(`(?:${properties.join("|")})\\s*:\\s*(\\d+(?:\\.\\d+)?)px`, "gi");
+  const values = Array.from(source.matchAll(pattern))
+    .map((match) => Number(match[1]))
+    .filter((value) => Number.isFinite(value) && value >= min && value <= max);
+  return values.length ? Math.round(Math.max(...values)) : undefined;
+}
+
+function inferImportedViewport(screen: ImportedScreen): ImportViewport {
+  const source = `${screen.html}\n${screen.css}`;
+  const explicitWidth = largestCssDimension(source, ["width", "min-width"], MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH);
+  const explicitHeight = largestCssDimension(source, ["height", "min-height"], MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT);
+  const viewportWidth = clampNumber(Math.round(window.innerWidth || DEFAULT_CANVAS_WIDTH), DEFAULT_CANVAS_WIDTH, 1920);
+  const viewportHeight = clampNumber(Math.round(window.innerHeight || DEFAULT_CANVAS_HEIGHT), DEFAULT_CANVAS_HEIGHT, 1080);
+  return {
+    width: explicitWidth ?? viewportWidth,
+    height: explicitHeight ?? viewportHeight
+  };
 }
 
 function importedScreenSrcdoc(screen: ImportedScreen): string {
@@ -543,14 +641,14 @@ function measuredElementName(node: HTMLElement, type: ElementType, text: string)
   return identity.replace(/[-_]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 42) || type;
 }
 
-function shouldSkipMeasuredNode(node: HTMLElement, rect: DOMRect, style: CSSStyleDeclaration): boolean {
+function shouldSkipMeasuredNode(node: HTMLElement, rect: DOMRect, style: CSSStyleDeclaration, viewport: ImportViewport): boolean {
   if (["script", "style", "meta", "link", "svg", "path"].includes(node.tagName.toLowerCase())) return true;
   if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return true;
   if (rect.width < 8 || rect.height < 8) return true;
-  if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= IMPORT_CANVAS_WIDTH || rect.top >= IMPORT_CANVAS_HEIGHT) return true;
+  if (rect.right <= 0 || rect.bottom <= 0 || rect.left >= viewport.width || rect.top >= viewport.height) return true;
   const area = rect.width * rect.height;
-  const viewportArea = IMPORT_CANVAS_WIDTH * IMPORT_CANVAS_HEIGHT;
-  if (area > viewportArea * 0.92 && !["topbar", "sidebar"].includes(node.id)) return true;
+  const viewportArea = viewport.width * viewport.height;
+  if (area > viewportArea * 0.98 && !["topbar", "sidebar"].includes(node.id)) return true;
   return false;
 }
 
@@ -564,21 +662,59 @@ function importElementImportance(type: ElementType | undefined, node: HTMLElemen
   return 1;
 }
 
-async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promise<ForgeElement[]> {
+function measuredContentBounds(doc: Document, viewport: ImportViewport): ImportViewport {
+  let right = Math.max(doc.documentElement.scrollWidth, doc.body.scrollWidth, viewport.width);
+  let bottom = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight, viewport.height);
+  Array.from(doc.body.querySelectorAll<HTMLElement>("*")).forEach((node) => {
+    const style = doc.defaultView!.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden") return;
+    const rect = node.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) return;
+    right = Math.max(right, Math.ceil(rect.right));
+    bottom = Math.max(bottom, Math.ceil(rect.bottom));
+  });
+  return {
+    width: clampNumber(right, MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH),
+    height: clampNumber(bottom, MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT)
+  };
+}
+
+function nodeSourcePath(node: HTMLElement): string {
+  const parts: string[] = [];
+  let current: HTMLElement | null = node;
+  while (current && current.tagName.toLowerCase() !== "body") {
+    const tag = current.tagName.toLowerCase();
+    const identity = current.id ? `#${current.id}` : Array.from(current.classList).slice(0, 2).map((name) => `.${name}`).join("");
+    parts.unshift(`${tag}${identity}`);
+    current = current.parentElement;
+  }
+  return parts.join(" > ");
+}
+
+async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promise<MeasuredImport> {
+  let viewport = inferImportedViewport(screen);
   const frame = document.createElement("iframe");
   // The source has already been sanitized; this temporary frame must remain
   // same-origin so Forge can read layout boxes and convert them into elements.
-  frame.style.cssText = `position:fixed;left:-20000px;top:0;width:${IMPORT_CANVAS_WIDTH}px;height:${IMPORT_CANVAS_HEIGHT}px;border:0;pointer-events:none;opacity:0;`;
+  frame.style.cssText = `position:fixed;left:-20000px;top:0;width:${viewport.width}px;height:${viewport.height}px;border:0;pointer-events:none;opacity:0;`;
   frame.srcdoc = importedScreenSrcdoc(screen);
   document.body.appendChild(frame);
   await waitForFrameReady(frame);
   const doc = frame.contentDocument;
   if (!doc) {
     frame.remove();
-    return [];
+    return { width: viewport.width, height: viewport.height, background: "#ffffff", elements: [] };
   }
   await doc.fonts?.ready.catch(() => undefined);
   await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+
+  const bounds = measuredContentBounds(doc, viewport);
+  if (bounds.width > viewport.width || bounds.height > viewport.height) {
+    viewport = bounds;
+    frame.style.width = `${viewport.width}px`;
+    frame.style.height = `${viewport.height}px`;
+    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  }
 
   const selector = [
     "#topbar",
@@ -625,11 +761,13 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
     "h1",
     "h2",
     "h3",
-    "h4"
+    "h4",
+    "[role]",
+    "[aria-label]"
   ].join(",");
 
   const seen = new Set<Element>();
-  const measured = Array.from(doc.body.querySelectorAll<HTMLElement>(selector))
+  const measuredItems = Array.from(doc.body.querySelectorAll<HTMLElement>(selector))
     .filter((node) => {
       if (seen.has(node)) return false;
       seen.add(node);
@@ -642,20 +780,23 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
       const type = importedNodeType(node, style, text);
       return { node, style, rect, text, type, area: rect.width * rect.height, importance: importElementImportance(type, node) };
     })
-    .filter((item) => item.type && !shouldSkipMeasuredNode(item.node, item.rect, item.style))
+    .filter((item) => item.type && !shouldSkipMeasuredNode(item.node, item.rect, item.style, viewport))
     .sort((a, b) => b.importance - a.importance || b.area - a.area)
     .slice(0, MAX_MEASURED_IMPORT_ELEMENTS)
-    .sort((a, b) => b.area - a.area)
+    .sort((a, b) => b.area - a.area);
+
+  const nodeToElementId = new Map<HTMLElement, string>();
+  const measured = measuredItems
     .map((item, index) => {
       const type = item.type as ElementType;
       const isText = type === "text";
       const isFrame = type === "frame";
       const rect = item.rect;
-      return makeElement(type, Math.max(0, Math.round(rect.left)), Math.max(0, Math.round(rect.top)), {
+      const element = makeElement(type, Math.max(0, Math.round(rect.left)), Math.max(0, Math.round(rect.top)), {
         name: measuredElementName(item.node, type, item.text),
         text: isFrame ? "" : item.text || item.node.getAttribute("placeholder") || measuredElementName(item.node, type, item.text),
-        w: Math.max(12, Math.round(Math.min(rect.width, IMPORT_CANVAS_WIDTH - Math.max(0, rect.left)))),
-        h: Math.max(12, Math.round(Math.min(rect.height, IMPORT_CANVAS_HEIGHT - Math.max(0, rect.top)))),
+        w: Math.max(12, Math.round(Math.min(rect.width, viewport.width - Math.max(0, rect.left)))),
+        h: Math.max(12, Math.round(Math.min(rect.height, viewport.height - Math.max(0, rect.top)))),
         fill: isText ? "transparent" : cssBackground(item.style),
         color: item.style.color || "#172033",
         border: item.style.borderTopColor || "transparent",
@@ -666,19 +807,41 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
         weight: Number.parseInt(item.style.fontWeight, 10) || (isText ? 700 : 600),
         opacity: Math.round((Number.parseFloat(item.style.opacity || "1") || 1) * 100),
         shadow: item.style.boxShadow === "none" ? "" : item.style.boxShadow,
+        sourceTag: item.node.tagName.toLowerCase(),
+        sourcePath: nodeSourcePath(item.node),
         z: index + 1
       });
+      nodeToElementId.set(item.node, element.id);
+      return { item, element };
     })
-    .map((element, index) => ({ ...element, z: index + 1 }));
+    .map(({ item, element }, index) => {
+      let parent = item.node.parentElement;
+      while (parent && parent !== doc.body) {
+        const parentId = nodeToElementId.get(parent);
+        if (parentId) {
+          element.parentId = parentId;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      return { ...element, z: index + 1 };
+    });
+
+  const bodyStyle = doc.defaultView!.getComputedStyle(doc.body);
+  const htmlStyle = doc.defaultView!.getComputedStyle(doc.documentElement);
+  const background = normalizeColor(bodyStyle.backgroundColor, normalizeColor(htmlStyle.backgroundColor, "#ffffff"));
 
   frame.remove();
-  return measured;
+  return { width: viewport.width, height: viewport.height, background, elements: measured };
 }
 
-async function elementsFromImportedScreen(screen: ImportedScreen, result: ImportAnalysisResult): Promise<ForgeElement[]> {
-  if (!shouldMeasureImportedScreen(screen, result)) return elementsFromHtml(screen.html, screen.css);
+async function measuredImportFromScreen(screen: ImportedScreen, result: ImportAnalysisResult): Promise<MeasuredImport> {
+  if (!shouldMeasureImportedScreen(screen, result)) {
+    const viewport = inferImportedViewport(screen);
+    return { width: viewport.width, height: viewport.height, background: "#ffffff", elements: elementsFromHtml(screen.html, screen.css) };
+  }
   const measured = await measuredElementsFromImportedScreen(screen);
-  return measured.length ? measured : elementsFromHtml(screen.html, screen.css);
+  return measured.elements.length ? measured : { ...measured, elements: elementsFromHtml(screen.html, screen.css) };
 }
 
 function shouldRepairStoredImport(project: HtmlForgeProject, model: ForgeDesignModel): boolean {
@@ -700,7 +863,7 @@ async function modelFromProject(project: HtmlForgeProject): Promise<ForgeDesignM
           repairedStoredImport = true;
           return await modelFromImport(analyzeHtmlImport(project.source!.rawText!, project.source!.fileName, true));
         }
-        return parsed;
+        return normalizeDesignModel(parsed);
       }
     } catch {
       // Fall through and rebuild from project pages.
@@ -711,8 +874,8 @@ async function modelFromProject(project: HtmlForgeProject): Promise<ForgeDesignM
     generatedId: page.generatedId || generatedScreenId(index),
     name: page.name,
     slug: page.slug || slugify(page.name),
-    width: 1200,
-    height: 800,
+    width: DEFAULT_CANVAS_WIDTH,
+    height: DEFAULT_CANVAS_HEIGHT,
     background: "#ffffff",
     elements: elementsFromHtml(page.html, page.css)
   }));
@@ -728,14 +891,16 @@ async function modelFromProject(project: HtmlForgeProject): Promise<ForgeDesignM
             generatedId: generatedScreenId(0),
             name: "Home",
             slug: "home",
-            width: 1200,
-            height: 800,
+            width: DEFAULT_CANVAS_WIDTH,
+            height: DEFAULT_CANVAS_HEIGHT,
             background: "#ffffff",
             elements: [makeElement("text", 80, 80, { text: "New UI", font: 48, w: 560, h: 90, z: 1 })]
           }
         ],
     templates: [],
     zoom: 100,
+    panX: 0,
+    panY: 0,
     grid: true,
     snap: true,
     nextNumber: 20
@@ -757,16 +922,19 @@ async function modelFromImport(result: ImportAnalysisResult): Promise<ForgeDesig
         }
       ];
   const pages: ForgeDesignPage[] = await Promise.all(
-    screens.map(async (screen, index) => ({
-      id: result.project.pages[index]?.id ?? createId("page"),
-      generatedId: generatedScreenId(index),
-      name: screen.name || `Screen ${index + 1}`,
-      slug: slugify(screen.name || `screen-${index + 1}`),
-      width: 1200,
-      height: 800,
-      background: "#ffffff",
-      elements: await elementsFromImportedScreen(screen, result)
-    }))
+    screens.map(async (screen, index) => {
+      const measured = await measuredImportFromScreen(screen, result);
+      return {
+        id: result.project.pages[index]?.id ?? createId("page"),
+        generatedId: generatedScreenId(index),
+        name: screen.name || `Screen ${index + 1}`,
+        slug: slugify(screen.name || `screen-${index + 1}`),
+        width: measured.width,
+        height: measured.height,
+        background: measured.background,
+        elements: measured.elements
+      };
+    })
   );
   const templates = importedTemplates(report.sanitizedHtml);
   const measuredScreenImport = pages.some((page) => page.elements.length > 24);
@@ -777,6 +945,8 @@ async function modelFromImport(result: ImportAnalysisResult): Promise<ForgeDesig
     pages,
     templates,
     zoom: measuredScreenImport ? 75 : 100,
+    panX: 0,
+    panY: 0,
     grid: true,
     snap: true,
     nextNumber: 100
@@ -1056,7 +1226,7 @@ function updateStatusOnly(): void {
 function render(): void {
   const theme = themes[app.model?.theme ?? "forge"];
   root.innerHTML = `
-    <div class="forge-app ${app.leftCollapsed ? "left-collapsed" : ""} ${app.rightCollapsed ? "right-collapsed" : ""} ${app.topCollapsed ? "top-collapsed" : ""}" style="--app-bg:${theme.bg};--panel:${theme.panel};--canvas:${theme.canvas};--text:${theme.text};--accent:${theme.accent};--accent-2:${theme.accent2};--muted:${theme.muted};--line:${theme.line}">
+    <div class="forge-app ${app.leftCollapsed ? "left-collapsed" : ""} ${app.rightCollapsed ? "right-collapsed" : ""} ${app.topCollapsed ? "top-collapsed" : ""}" style="--app-bg:${theme.bg};--panel:${theme.panel};--canvas:${theme.canvas};--text:${theme.text};--accent:${theme.accent};--accent-2:${theme.accent2};--muted:${theme.muted};--line:${theme.line};--left-width:${app.leftWidth}px;--right-width:${app.rightWidth}px">
       ${topbarMarkup()}
       ${leftPanelMarkup()}
       ${canvasMarkup()}
@@ -1099,6 +1269,7 @@ function topbarMarkup(): string {
         <span class="zoom-readout">${app.model?.zoom ?? 100}%</span>
         <button class="icon-button" title="Zoom in (Ctrl++)" aria-label="Zoom in" data-action="zoom-in">${icon("zoomIn")}</button>
         <button class="icon-button" title="Fit canvas (Ctrl+0)" aria-label="Fit canvas" data-action="fit">${icon("fit")}</button>
+        <button class="secondary-button compact" title="100% native scale (Ctrl+1)" data-action="zoom-100">100%</button>
       </div>
       <div class="top-actions">
         <select data-action="open-project-select" aria-label="Open project">
@@ -1121,17 +1292,18 @@ function quickAddButton(type: ElementType, label: string): string {
 
 function leftPanelMarkup(): string {
   return `
-    <aside class="left-panel" aria-label="Editor library">
+    <aside class="left-panel" aria-label="Project Explorer">
       <button class="panel-collapse left" title="${app.leftCollapsed ? "Show left panel" : "Hide left panel"}" aria-label="${app.leftCollapsed ? "Show left panel" : "Hide left panel"}" data-action="toggle-left">${app.leftCollapsed ? icon("expand") : icon("collapse")}</button>
-      <div class="panel-tabs">
-        ${panelButton("pages", "pages", "Pages")}
-        ${panelButton("components", "components", "Build")}
+      <div class="panel-titlebar"><strong>Project Explorer</strong></div>
+      <div class="panel-body">${leftPanelBody()}</div>
+      <div class="panel-tabs bottom-tabs">
+        ${panelButton("pages", "pages", "Application")}
         ${panelButton("reuse", "reuse", "Reuse")}
         ${panelButton("assets", "image", "Assets")}
         ${panelButton("themes", "theme", "Theme")}
         ${panelButton("import", "import", "Import")}
       </div>
-      <div class="panel-body">${leftPanelBody()}</div>
+      <div class="panel-resizer panel-resizer-left" data-resize-panel="left" title="Resize Project Explorer"></div>
     </aside>
   `;
 }
@@ -1143,7 +1315,6 @@ function panelButton(id: PanelId, iconName: keyof typeof iconPaths, label: strin
 function leftPanelBody(): string {
   if (!app.model || !app.project) return projectStartMarkup();
   if (app.activePanel === "pages") return pagesPanelMarkup();
-  if (app.activePanel === "components") return componentsPanelMarkup();
   if (app.activePanel === "reuse") return reusePanelMarkup();
   if (app.activePanel === "assets") return assetsPanelMarkup();
   if (app.activePanel === "themes") return themesPanelMarkup();
@@ -1162,39 +1333,42 @@ function projectStartMarkup(): string {
 
 function pagesPanelMarkup(): string {
   const page = activePage();
+  const pages = app.model!.pages;
   return `
     <section class="panel-section">
-      <div class="section-head"><h2>Pages</h2><button class="secondary-button compact" data-action="add-page">${icon("add")} Add</button></div>
-      <div class="list-stack">
-        ${app.model!.pages
-          .map(
-            (candidate, index) => `
-              <button class="page-row ${candidate.id === page?.id ? "is-active" : ""}" data-page-id="${candidate.id}">
-                <span>${index + 1}</span>
-                <strong>${escapeHtml(candidate.name)}</strong>
-                <small>${candidate.width} x ${candidate.height}, ${candidate.elements.length} elements</small>
-              </button>`
-          )
-          .join("")}
+      <div class="section-head"><h2>Application</h2><button class="secondary-button compact" data-action="add-page">${icon("add")} Display</button></div>
+      <div class="project-tree" role="tree">
+        <div class="project-tree-row root-row">${icon("folder")}<strong>${escapeHtml(app.project?.name ?? "Project")}</strong></div>
+        <div class="project-tree-row branch-row">${icon("chevronDown")}${icon("folder")}<strong>Displays</strong></div>
+        <div class="display-list">
+          ${pages
+            .map(
+              (candidate, index) => `
+                <button class="project-tree-row display-row ${candidate.id === page?.id ? "is-active" : ""}" data-page-id="${candidate.id}" role="treeitem">
+                  <span class="tree-line"></span>
+                  ${icon("file")}
+                  <span>${String(index + 1).padStart(3, "0")} ${escapeHtml(candidate.name)}</span>
+                </button>`
+            )
+            .join("")}
+        </div>
+        <div class="project-tree-row branch-row">${icon("chevronDown")}${icon("nav")}<strong>Navigation</strong></div>
+        <div class="navigation-list">
+          ${pages
+            .map((candidate) => `<button class="project-tree-row nav-row" data-page-nav-target="${candidate.id}"><span class="tree-line"></span>${icon("nav")}<span>Add button to ${escapeHtml(candidate.name)}</span></button>`)
+            .join("")}
+        </div>
       </div>
-      <label class="field-label">Page name <input type="text" data-page-prop="name" value="${escapeAttribute(page?.name ?? "")}"></label>
     </section>
     <section class="panel-section">
-      <h2>Layers</h2>
-      <div class="list-stack layer-stack">
-        ${(page?.elements ?? [])
-          .slice()
-          .sort((a, b) => b.z - a.z)
-          .map(
-            (element) => `
-            <button class="layer-row ${app.selectedIds.includes(element.id) ? "is-active" : ""}" data-layer-id="${element.id}">
-              ${icon("layers")}
-              <span>${escapeHtml(element.name)}</span>
-              <small>${escapeHtml(element.type)}${element.hidden ? " hidden" : ""}${element.locked ? " locked" : ""}</small>
-            </button>`
-          )
-          .join("") || `<p class="muted">No elements yet. Add one from Build.</p>`}
+      <h2>Display Setup</h2>
+      <label class="field-label">Page name <input type="text" data-page-prop="name" value="${escapeAttribute(page?.name ?? "")}"></label>
+      ${canvasFieldsMarkup()}
+      <div class="button-row">
+        <button class="secondary-button compact" data-action="add-nav-button">${icon("nav")} Add nav button</button>
+        <button class="secondary-button compact" data-action="add-nav-menu">${icon("pages")} Build menu</button>
       </div>
+      <p class="muted">Navigation buttons are editable objects. Change their targets in the Property Panel.</p>
     </section>
   `;
 }
@@ -1218,6 +1392,31 @@ function componentsPanelMarkup(): string {
     .join("");
 }
 
+function templatePreviewMarkup(elements: ForgeElement[]): string {
+  if (!elements.length) return `<span class="reuse-preview empty-preview">No preview</span>`;
+  const visible = elements.filter((element) => !element.hidden);
+  const items = visible.length ? visible : elements;
+  const minX = Math.min(...items.map((element) => element.x));
+  const minY = Math.min(...items.map((element) => element.y));
+  const maxX = Math.max(...items.map((element) => element.x + element.w));
+  const maxY = Math.max(...items.map((element) => element.y + element.h));
+  const width = Math.max(40, maxX - minX);
+  const height = Math.max(28, maxY - minY);
+  const scale = Math.min(1, 190 / width, 82 / height);
+  return `
+    <span class="reuse-preview" aria-hidden="true">
+      <span class="reuse-preview-stage" style="width:${width}px;height:${height}px;transform:scale(${scale});">
+        ${items
+          .map((element) => {
+            const previewElement = { ...element, x: element.x - minX, y: element.y - minY, shadow: "" };
+            return `<span class="preview-element type-${element.type}" style="${escapeAttribute(elementStyle(previewElement))}">${compileElementContent(previewElement)}</span>`;
+          })
+          .join("")}
+      </span>
+    </span>
+  `;
+}
+
 function reusePanelMarkup(): string {
   const templates = app.model?.templates ?? [];
   return `
@@ -1228,8 +1427,8 @@ function reusePanelMarkup(): string {
           .map(
             (template) => `
               <button class="template-row" data-template-id="${template.id}">
-                <strong>${escapeHtml(template.name)}</strong>
-                <small>${escapeHtml(template.category)} - ${template.elements.length} element${template.elements.length === 1 ? "" : "s"}</small>
+                ${templatePreviewMarkup(template.elements)}
+                <span><strong>${escapeHtml(template.name)}</strong><small>${escapeHtml(template.category)} - ${template.elements.length} element${template.elements.length === 1 ? "" : "s"}</small></span>
               </button>`
           )
           .join("") || `<p class="muted">Select elements and save them here. Imported buttons/forms also land here.</p>`}
@@ -1240,7 +1439,13 @@ function reusePanelMarkup(): string {
       <div class="list-stack">
         ${app.library
           .slice(-10)
-          .map((item) => `<button class="template-row" data-library-id="${item.id}"><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.category)} - ${escapeHtml(item.scope)}</small></button>`)
+          .map((item) => {
+            const template = item.data as ForgeTemplate | undefined;
+            return `<button class="template-row" data-library-id="${item.id}">
+              ${template?.elements ? templatePreviewMarkup(template.elements) : `<span class="reuse-preview empty-preview">HTML</span>`}
+              <span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.category)} - ${escapeHtml(item.scope)}</small></span>
+            </button>`;
+          })
           .join("") || `<p class="muted">No saved library items yet.</p>`}
       </div>
     </section>
@@ -1319,19 +1524,20 @@ function canvasMarkup(): string {
   const scale = app.model.zoom / 100;
   return `
     <main class="canvas-workspace" id="workspace">
-      <div class="stage">
-        <div class="canvas-size-wrap" style="width:${page.width * scale}px;height:${page.height * scale}px">
-          <section class="design-canvas ${app.model.grid ? "show-grid" : ""}" id="design-canvas" style="width:${page.width}px;height:${page.height}px;background:${page.background};transform:scale(${scale});">
+      <div class="stage-viewport" id="stage-viewport">
+        <div class="stage-camera" id="stage-camera" style="width:${page.width}px;height:${page.height}px;transform:translate(${app.model.panX}px, ${app.model.panY}px) scale(${scale});">
+          <section class="design-canvas ${app.model.grid ? "show-grid" : ""}" id="design-canvas" style="width:${page.width}px;height:${page.height}px;background:${page.background};">
             ${page.elements.map((element) => elementMarkup(element)).join("")}
           </section>
         </div>
       </div>
-      <div class="floating-tools">
+      <div class="floating-tools" aria-label="Canvas camera controls">
         <button class="tool-square ${app.activeTool === "select" ? "is-active" : ""}" data-tool="select" title="Select">${icon("pointer")}</button>
         <button class="tool-square ${app.activeTool === "hand" ? "is-active" : ""}" data-tool="hand" title="Pan">${icon("hand")}</button>
         <button class="tool-square ${app.activeTool === "text" ? "is-active" : ""}" data-tool="text" title="Text">${icon("text")}</button>
         <button class="tool-square ${app.activeTool === "frame" ? "is-active" : ""}" data-tool="frame" title="Frame">${icon("frame")}</button>
         <span>${page.width} x ${page.height}</span>
+        <span>Pan ${Math.round(app.model.panX)}, ${Math.round(app.model.panY)}</span>
       </div>
     </main>
   `;
@@ -1361,16 +1567,298 @@ function resizeHandlesMarkup(): string {
 
 function rightPanelMarkup(): string {
   return `
-    <aside class="right-panel" aria-label="Inspector">
+    <aside class="right-panel" aria-label="Object tools and properties">
       <button class="panel-collapse right" title="${app.rightCollapsed ? "Show inspector" : "Hide inspector"}" aria-label="${app.rightCollapsed ? "Show inspector" : "Hide inspector"}" data-action="toggle-right">${app.rightCollapsed ? icon("collapse") : icon("expand")}</button>
-      <div class="inspector-tabs">
-        ${inspectorTab("design", "Design")}
-        ${inspectorTab("layout", "Layout")}
-        ${inspectorTab("actions", "Actions")}
-        ${inspectorTab("canvas", "Canvas")}
+      <div class="panel-titlebar utility-titlebar"><strong>${utilityTitle()}</strong></div>
+      <div class="utility-body">${utilityBodyMarkup()}</div>
+      <div class="utility-tabs">
+        ${utilityTabButton("toolbox", "Toolbox")}
+        ${utilityTabButton("objects", "Object Explorer")}
+        ${utilityTabButton("properties", "Property Panel")}
       </div>
-      <div class="inspector-body">${inspectorBodyMarkup()}</div>
+      <div class="panel-resizer panel-resizer-right" data-resize-panel="right" title="Resize right panel"></div>
     </aside>
+  `;
+}
+
+function utilityTitle(): string {
+  if (app.utilityTab === "toolbox") return "Toolbox";
+  if (app.utilityTab === "objects") return "Object Explorer";
+  return "Property Panel";
+}
+
+function utilityTabButton(id: UtilityTab, label: string): string {
+  return `<button class="${app.utilityTab === id ? "is-active" : ""}" data-utility-tab="${id}">${escapeHtml(label)}</button>`;
+}
+
+function utilityBodyMarkup(): string {
+  if (app.utilityTab === "toolbox") return toolboxMarkup();
+  if (app.utilityTab === "objects") return objectExplorerMarkup();
+  return propertyPanelMarkup();
+}
+
+const toolboxGroups: Array<{ title: string; items: Array<{ id: string; label: string; icon: keyof typeof iconPaths }> }> = [
+  {
+    title: "Common Objects",
+    items: [
+      { id: "text", label: "Text", icon: "text" },
+      { id: "image", label: "Image", icon: "image" },
+      { id: "panel", label: "Panel", icon: "rectangle" }
+    ]
+  },
+  {
+    title: "Drawing",
+    items: [
+      { id: "rectangle", label: "Rectangle", icon: "rectangle" },
+      { id: "rounded-rectangle", label: "Rounded Rectangle", icon: "rectangle" },
+      { id: "ellipse", label: "Ellipse", icon: "ellipse" },
+      { id: "line", label: "Line", icon: "line" },
+      { id: "polygon", label: "Polygon", icon: "polygon" }
+    ]
+  },
+  {
+    title: "Push Button",
+    items: [
+      { id: "momentary-button", label: "Momentary Button", icon: "buttonIcon" as keyof typeof iconPaths },
+      { id: "maintained-button", label: "Maintained Button", icon: "buttonIcon" as keyof typeof iconPaths },
+      { id: "latched-button", label: "Latched Button", icon: "buttonIcon" as keyof typeof iconPaths },
+      { id: "interlocked-button", label: "Interlocked Button", icon: "buttonIcon" as keyof typeof iconPaths }
+    ]
+  },
+  {
+    title: "Numeric and String",
+    items: [
+      { id: "numeric-display", label: "Numeric Display", icon: "indicator" },
+      { id: "numeric-input", label: "Numeric Input Enable", icon: "indicator" },
+      { id: "string-display", label: "String Display", icon: "text" },
+      { id: "string-input", label: "String Input Enable", icon: "text" }
+    ]
+  },
+  {
+    title: "Display Navigation",
+    items: [
+      { id: "goto-display", label: "Goto Display", icon: "nav" },
+      { id: "return-display", label: "Return To Display", icon: "nav" },
+      { id: "close-display", label: "Close Display", icon: "nav" },
+      { id: "display-menu", label: "Display List Selector", icon: "pages" }
+    ]
+  },
+  {
+    title: "Indicator",
+    items: [
+      { id: "multistate-indicator", label: "Multistate Indicator", icon: "indicator" },
+      { id: "symbol-indicator", label: "Symbol Indicator", icon: "indicator" },
+      { id: "list-indicator", label: "List Indicator", icon: "layers" }
+    ]
+  },
+  {
+    title: "Gauge and Graph",
+    items: [
+      { id: "bar-graph", label: "Bar Graph", icon: "gauge" },
+      { id: "gauge", label: "Gauge", icon: "gauge" },
+      { id: "scale", label: "Scale", icon: "line" }
+    ]
+  }
+];
+
+function toolboxMarkup(): string {
+  return `
+    <div class="toolbox-panel">
+      <div class="panel-search">${icon("search")}<input type="search" placeholder="Find tool"></div>
+      ${toolboxGroups
+        .map(
+          (group) => `
+          <section class="toolbox-group">
+            <h2>${icon("chevronDown")}${escapeHtml(group.title)}</h2>
+            ${group.items
+              .map((item) => `<button class="toolbox-row" data-add-tool="${item.id}">${icon(item.icon)}<span>${escapeHtml(item.label)}</span></button>`)
+              .join("")}
+          </section>`
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+interface ObjectTreeNode {
+  element: ForgeElement;
+  children: ObjectTreeNode[];
+}
+
+function objectTree(page: ForgeDesignPage): ObjectTreeNode[] {
+  const sorted = page.elements.slice().sort((a, b) => a.z - b.z);
+  const nodes = new Map<string, ObjectTreeNode>();
+  sorted.forEach((element) => nodes.set(element.id, { element, children: [] }));
+  const roots: ObjectTreeNode[] = [];
+  sorted.forEach((element) => {
+    const node = nodes.get(element.id)!;
+    const parent = element.parentId ? nodes.get(element.parentId) : undefined;
+    if (parent && parent.element.id !== element.id) parent.children.push(node);
+    else roots.push(node);
+  });
+  return roots;
+}
+
+function objectNodeMarkup(node: ObjectTreeNode, level: number): string {
+  const element = node.element;
+  const selected = app.selectedIds.includes(element.id);
+  const collapsed = app.collapsedObjectIds.has(element.id);
+  const hasChildren = node.children.length > 0;
+  return `
+    <div class="object-node">
+      <div class="object-row ${selected ? "is-active" : ""}" style="--tree-level:${level}">
+        <button class="tree-toggle" data-object-toggle="${element.id}" ${hasChildren ? "" : "disabled"} aria-label="${collapsed ? "Expand" : "Collapse"} ${escapeAttribute(element.name)}">${hasChildren ? icon(collapsed ? "chevronRight" : "chevronDown") : ""}</button>
+        <label class="visibility-check" title="${element.hidden ? "Show" : "Hide"} ${escapeAttribute(element.name)}">
+          <input type="checkbox" data-object-visible="${element.id}" ${element.hidden ? "" : "checked"}>
+        </label>
+        <button class="object-select" data-layer-id="${element.id}">
+          ${icon(element.type === "frame" || element.type === "card" ? "folder" : "file")}
+          <span>${escapeHtml(element.name)}</span>
+        </button>
+        <button class="tree-state" data-object-lock="${element.id}" title="${element.locked ? "Unlock" : "Lock"}">${icon(element.locked ? "lock" : "unlock")}</button>
+      </div>
+      ${hasChildren && !collapsed ? `<div class="object-children">${node.children.map((child) => objectNodeMarkup(child, level + 1)).join("")}</div>` : ""}
+    </div>
+  `;
+}
+
+function objectExplorerMarkup(): string {
+  const page = activePage();
+  if (!page) return `<p class="muted">No display open.</p>`;
+  const tree = objectTree(page);
+  return `
+    <div class="object-explorer">
+      <div class="object-root">${icon("chevronDown")}<label class="visibility-check"><input type="checkbox" checked></label>${icon("file")}<strong>Display</strong></div>
+      <div class="object-tree">
+        ${tree.map((node) => objectNodeMarkup(node, 0)).join("") || `<p class="muted">No objects on this display.</p>`}
+      </div>
+      <div class="object-footer">
+        <label class="check-row"><input type="checkbox" data-action="toggle-highlight" ${app.highlightObjects ? "checked" : ""}> Highlighting on</label>
+        <button class="secondary-button compact" data-action="expand-objects">Expand</button>
+        <button class="secondary-button compact" data-action="collapse-objects">Collapse</button>
+        <button class="secondary-button compact" data-action="group-selection">Group</button>
+        <button class="secondary-button compact" data-action="ungroup-selection">Ungroup</button>
+      </div>
+    </div>
+  `;
+}
+
+type PropertyField = { key: keyof ForgeElement; label: string; type: "text" | "number" | "color" | "boolean" };
+
+const propertyFields: PropertyField[] = [
+  { key: "name", label: "Name", type: "text" },
+  { key: "x", label: "Left", type: "number" },
+  { key: "y", label: "Top", type: "number" },
+  { key: "w", label: "Width", type: "number" },
+  { key: "h", label: "Height", type: "number" },
+  { key: "rotation", label: "Rotation", type: "number" },
+  { key: "hidden", label: "Visible", type: "boolean" },
+  { key: "locked", label: "Locked", type: "boolean" },
+  { key: "fill", label: "Fill", type: "color" },
+  { key: "color", label: "TextColor", type: "color" },
+  { key: "border", label: "BorderColor", type: "color" },
+  { key: "borderWidth", label: "BorderWidth", type: "number" },
+  { key: "radius", label: "Radius", type: "number" },
+  { key: "font", label: "FontSize", type: "number" },
+  { key: "weight", label: "FontWeight", type: "number" },
+  { key: "opacity", label: "Opacity", type: "number" },
+  { key: "z", label: "ZIndex", type: "number" }
+];
+
+function sharedValue(elements: ForgeElement[], key: keyof ForgeElement): unknown {
+  const first = elements[0]?.[key];
+  return elements.every((element) => element[key] === first) ? first : "";
+}
+
+function propertyInputMarkup(field: PropertyField, elements: ForgeElement[]): string {
+  const value = sharedValue(elements, field.key);
+  if (field.type === "boolean") {
+    const checked = field.key === "hidden" ? !Boolean(value) : Boolean(value);
+    return `<input type="checkbox" data-property-flag="${String(field.key)}" ${checked ? "checked" : ""}>`;
+  }
+  if (field.type === "color") {
+    return `<input type="color" data-el-prop="${String(field.key)}" value="${normalizeColor(String(value || ""), field.key === "color" ? "#172033" : "#ffffff")}">`;
+  }
+  return `<input type="${field.type}" data-el-prop="${String(field.key)}" value="${escapeAttribute(String(value ?? ""))}">`;
+}
+
+function propertyPanelMarkup(): string {
+  const selected = selectedElements();
+  if (!selected.length) return canvasPropertyPanelMarkup();
+  const selectedName = selected.length === 1 ? selected[0].name : "Multiple Selection";
+  return `
+    <div class="property-panel">
+      <input class="property-selected-name" type="text" data-el-prop="name" value="${escapeAttribute(selectedName)}" ${selected.length > 1 ? "disabled" : ""}>
+      <div class="property-help"><button class="mini-help" type="button">?</button></div>
+      <div class="property-tabs">
+        <button class="${app.propertyTab === "properties" ? "is-active" : ""}" data-property-tab="properties">Properties</button>
+        <button class="${app.propertyTab === "connections" ? "is-active" : ""}" data-property-tab="connections">Connections</button>
+      </div>
+      ${
+        app.propertyTab === "connections"
+          ? connectionsGridMarkup(selected)
+          : `<div class="property-options">
+              <label><input type="radio" checked> All Properties</label>
+              <label><input type="radio"> Shared Properties</label>
+            </div>
+            <label class="check-row"><input type="checkbox" checked> Include Grouped Objects</label>
+            <div class="property-grid">
+              ${propertyFields
+                .map((field) => {
+                  const prefix = selected.length === 1 ? selected[0].type[0].toUpperCase() + selected[0].type.slice(1) : "Object";
+                  return `<label class="property-row"><span>(${prefix}${field.label})</span>${propertyInputMarkup(field, selected)}</label>`;
+                })
+                .join("")}
+            </div>`
+      }
+    </div>
+  `;
+}
+
+function canvasPropertyPanelMarkup(): string {
+  const page = activePage();
+  return `
+    <div class="property-panel">
+      <input class="property-selected-name" value="${escapeAttribute(page?.name ?? "Display")}" disabled>
+      <div class="property-tabs"><button class="is-active">Display</button></div>
+      <div class="property-grid">
+        <label class="property-row"><span>(DisplayName)</span><input type="text" data-page-prop="name" value="${escapeAttribute(page?.name ?? "")}"></label>
+        <label class="property-row"><span>(DisplayWidth)</span><input type="number" data-page-prop="width" value="${page?.width ?? DEFAULT_CANVAS_WIDTH}"></label>
+        <label class="property-row"><span>(DisplayHeight)</span><input type="number" data-page-prop="height" value="${page?.height ?? DEFAULT_CANVAS_HEIGHT}"></label>
+        <label class="property-row"><span>(DisplayBackground)</span><input type="color" data-page-prop="background" value="${normalizeColor(page?.background ?? "#ffffff")}"></label>
+      </div>
+      <div class="button-row property-actions">
+        <button class="secondary-button compact" data-action="add-nav-button">${icon("nav")} Nav Button</button>
+        <button class="secondary-button compact" data-action="add-nav-menu">${icon("pages")} Full Menu</button>
+      </div>
+    </div>
+  `;
+}
+
+function connectionsGridMarkup(selected: ForgeElement[]): string {
+  const element = selected[0];
+  return `
+    <div class="property-grid">
+      <label class="property-row"><span>(Action)</span>
+        <select data-el-prop="action">
+          <option value="" ${element.action === "" ? "selected" : ""}>None</option>
+          <option value="page" ${element.action === "page" ? "selected" : ""}>Go to display</option>
+          <option value="toggle" ${element.action === "toggle" ? "selected" : ""}>Toggle object</option>
+        </select>
+      </label>
+      <label class="property-row"><span>(Target)</span>
+        <select data-el-prop="target">
+          <option value="">Choose target...</option>
+          ${app.model!.pages.map((page) => `<option value="${page.id}" ${page.id === element.target ? "selected" : ""}>${escapeHtml(page.name)}</option>`).join("")}
+          ${activePage()!.elements.map((candidate) => `<option value="${candidate.id}" ${candidate.id === element.target ? "selected" : ""}>${escapeHtml(candidate.name)}</option>`).join("")}
+        </select>
+      </label>
+      <label class="property-row"><span>(ButtonText)</span><input type="text" data-el-prop="text" value="${escapeAttribute(element.text)}"></label>
+    </div>
+    <div class="button-row property-actions">
+      <button class="secondary-button compact" data-action="add-nav-button">${icon("nav")} Add nav button</button>
+      <button class="secondary-button compact" data-action="add-nav-menu">${icon("pages")} Build menu</button>
+    </div>
   `;
 }
 
@@ -1521,8 +2009,8 @@ function canvasFieldsMarkup(): string {
   const page = activePage();
   return `
     <div class="field-grid two">
-      <label class="field-label">Width <input type="number" data-page-prop="width" value="${page?.width ?? 1200}"></label>
-      <label class="field-label">Height <input type="number" data-page-prop="height" value="${page?.height ?? 800}"></label>
+      <label class="field-label">Width <input type="number" data-page-prop="width" value="${page?.width ?? DEFAULT_CANVAS_WIDTH}"></label>
+      <label class="field-label">Height <input type="number" data-page-prop="height" value="${page?.height ?? DEFAULT_CANVAS_HEIGHT}"></label>
       <label class="field-label">Background <input type="color" data-page-prop="background" value="${normalizeColor(page?.background ?? "#ffffff")}"></label>
     </div>
     <label class="check-row"><input type="checkbox" data-model-flag="grid" ${app.model?.grid ? "checked" : ""}> Show grid</label>
@@ -1670,14 +2158,48 @@ function bindEvents(): void {
       render();
     });
   });
+  root.querySelectorAll<HTMLElement>("[data-utility-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.utilityTab = button.dataset.utilityTab as UtilityTab;
+      app.rightCollapsed = false;
+      render();
+    });
+  });
+  root.querySelectorAll<HTMLElement>("[data-property-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      app.propertyTab = button.dataset.propertyTab as PropertyTab;
+      render();
+    });
+  });
   root.querySelectorAll<HTMLElement>("[data-add-element]").forEach((button) => {
     button.addEventListener("click", () => addElement(button.dataset.addElement as ElementType));
+  });
+  root.querySelectorAll<HTMLElement>("[data-add-tool]").forEach((button) => {
+    button.addEventListener("click", () => addToolPreset(button.dataset.addTool ?? ""));
   });
   root.querySelectorAll<HTMLElement>("[data-page-id]").forEach((button) => {
     button.addEventListener("click", () => selectPage(button.dataset.pageId ?? ""));
   });
+  root.querySelectorAll<HTMLElement>("[data-page-nav-target]").forEach((button) => {
+    button.addEventListener("click", () => addNavigationButton(button.dataset.pageNavTarget ?? ""));
+  });
   root.querySelectorAll<HTMLElement>("[data-layer-id]").forEach((button) => {
-    button.addEventListener("click", () => selectElement(button.dataset.layerId ?? ""));
+    button.addEventListener("click", (event) => selectElement(button.dataset.layerId ?? "", event.shiftKey));
+  });
+  root.querySelectorAll<HTMLElement>("[data-object-toggle]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleObjectCollapsed(button.dataset.objectToggle ?? "");
+    });
+  });
+  root.querySelectorAll<HTMLInputElement>("[data-object-visible]").forEach((field) => {
+    field.addEventListener("change", () => setObjectVisible(field.dataset.objectVisible ?? "", field.checked));
+  });
+  root.querySelectorAll<HTMLElement>("[data-object-lock]").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      toggleObjectLocked(button.dataset.objectLock ?? "");
+    });
   });
   root.querySelectorAll<HTMLElement>("[data-template-id]").forEach((button) => {
     button.addEventListener("click", () => insertTemplate(button.dataset.templateId ?? ""));
@@ -1698,6 +2220,12 @@ function bindEvents(): void {
   root.querySelectorAll<HTMLInputElement>("[data-el-flag]").forEach((field) => {
     field.addEventListener("change", () => updateSelectedFlag(field.dataset.elFlag ?? "", field.checked));
   });
+  root.querySelectorAll<HTMLInputElement>("[data-property-flag]").forEach((field) => {
+    field.addEventListener("change", () => {
+      const flag = field.dataset.propertyFlag ?? "";
+      updateSelectedFlag(flag, flag === "hidden" ? !field.checked : field.checked);
+    });
+  });
   root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>("[data-page-prop]").forEach((field) => {
     const eventName = field.type === "color" ? "input" : "change";
     field.addEventListener(eventName, () => updatePageProp(field.dataset.pageProp ?? "", field.value));
@@ -1716,10 +2244,13 @@ function bindEvents(): void {
 
   const canvas = root.querySelector<HTMLElement>("#design-canvas");
   const workspace = root.querySelector<HTMLElement>("#workspace");
+  const viewport = root.querySelector<HTMLElement>("#stage-viewport");
   canvas?.addEventListener("pointerdown", startCanvasPointer);
   workspace?.addEventListener("pointerdown", startWorkspacePointer);
+  viewport?.addEventListener("wheel", onViewportWheel, { passive: false });
   root.querySelectorAll<HTMLElement>("[data-element-id]").forEach((element) => element.addEventListener("pointerdown", startElementPointer));
   root.querySelectorAll<HTMLElement>("[data-resize-handle]").forEach((handle) => handle.addEventListener("pointerdown", startResizePointer));
+  root.querySelectorAll<HTMLElement>("[data-resize-panel]").forEach((handle) => handle.addEventListener("pointerdown", startPanelResize));
   root.querySelectorAll<HTMLElement>("[data-inline-edit]").forEach((editable) => {
     editable.addEventListener("input", () => {
       const element = activePage()?.elements.find((candidate) => candidate.id === editable.dataset.inlineEdit);
@@ -1777,6 +2308,9 @@ async function handleAction(action: string): Promise<void> {
     case "fit":
       fitCanvas();
       break;
+    case "zoom-100":
+      setZoom(100);
+      break;
     case "toggle-left":
       app.leftCollapsed = !app.leftCollapsed;
       render();
@@ -1797,6 +2331,29 @@ async function handleAction(action: string): Promise<void> {
       break;
     case "save-template":
       await saveTemplate();
+      break;
+    case "add-nav-button":
+      addNavigationButton();
+      break;
+    case "add-nav-menu":
+      addNavigationMenu();
+      break;
+    case "expand-objects":
+      app.collapsedObjectIds.clear();
+      render();
+      break;
+    case "collapse-objects":
+      collapseAllObjects();
+      break;
+    case "toggle-highlight":
+      app.highlightObjects = !app.highlightObjects;
+      render();
+      break;
+    case "group-selection":
+      groupSelection();
+      break;
+    case "ungroup-selection":
+      ungroupSelection();
       break;
     case "bring-front":
       arrangeSelection("front");
@@ -1819,17 +2376,56 @@ async function handleAction(action: string): Promise<void> {
   }
 }
 
-function addElement(type: ElementType, at?: { x: number; y: number }): void {
+function addElement(type: ElementType, at?: { x: number; y: number }, overrides: Partial<ForgeElement> = {}): ForgeElement | undefined {
   const page = activePage();
-  if (!app.model || !page) return;
+  if (!app.model || !page) return undefined;
   pushHistory("add element");
-  const element = makeElement(type, at?.x ?? 90 + page.elements.length * 12, at?.y ?? 90 + page.elements.length * 12);
+  const element = makeElement(type, at?.x ?? 90 + page.elements.length * 12, at?.y ?? 90 + page.elements.length * 12, overrides);
   element.z = nextZ(page);
   page.elements.push(element);
   app.selectedIds = [element.id];
   app.inspectorTab = type === "frame" ? "layout" : "design";
+  app.utilityTab = "properties";
   app.activeTool = "select";
   markDirty(true);
+  return element;
+}
+
+function addToolPreset(id: string): void {
+  const page = activePage();
+  if (!page) return;
+  const x = 80 + (page.elements.length % 8) * 14;
+  const y = 80 + (page.elements.length % 8) * 14;
+  const presets: Record<string, { type: ElementType; overrides: Partial<ForgeElement> }> = {
+    text: { type: "text", overrides: { name: "Text", text: "Text", w: 180, h: 42, font: 18, weight: 600 } },
+    image: { type: "image", overrides: { name: "Image", text: "Image" } },
+    panel: { type: "frame", overrides: { name: "Panel", w: 360, h: 220, fill: "#f8fafc", border: "#8ba2bd", radius: 0 } },
+    rectangle: { type: "shape", overrides: { name: "Rectangle", w: 160, h: 96, radius: 0, fill: "#e5e7eb", border: "#64748b" } },
+    "rounded-rectangle": { type: "shape", overrides: { name: "Rounded Rectangle", w: 160, h: 96, radius: 14, fill: "#e5e7eb", border: "#64748b" } },
+    ellipse: { type: "shape", overrides: { name: "Ellipse", w: 130, h: 92, radius: 999, fill: "#e0f2fe", border: "#0284c7" } },
+    line: { type: "shape", overrides: { name: "Line", w: 180, h: 4, radius: 999, fill: "#334155", border: "#334155" } },
+    polygon: { type: "shape", overrides: { name: "Polygon", w: 120, h: 120, radius: 12, fill: "#fde68a", border: "#92400e" } },
+    "momentary-button": { type: "button", overrides: { name: "Momentary Button", text: "Momentary", fill: "#2563eb", border: "#1d4ed8" } },
+    "maintained-button": { type: "button", overrides: { name: "Maintained Button", text: "Maintained", fill: "#0f766e", border: "#115e59" } },
+    "latched-button": { type: "button", overrides: { name: "Latched Button", text: "Latched", fill: "#7c3aed", border: "#6d28d9" } },
+    "interlocked-button": { type: "button", overrides: { name: "Interlocked Button", text: "Interlock", fill: "#b45309", border: "#92400e" } },
+    "numeric-display": { type: "text", overrides: { name: "Numeric Display", text: "123", w: 120, h: 42, font: 20, weight: 800 } },
+    "numeric-input": { type: "input", overrides: { name: "Numeric Input", text: "0" } },
+    "string-display": { type: "text", overrides: { name: "String Display", text: "String", w: 180, h: 42, font: 18, weight: 700 } },
+    "string-input": { type: "input", overrides: { name: "String Input", text: "Value" } },
+    "goto-display": { type: "button", overrides: { name: "Goto Display", text: "Goto", action: "page", target: app.model?.pages.find((candidate) => candidate.id !== page.id)?.id ?? "" } },
+    "return-display": { type: "button", overrides: { name: "Return To Display", text: "Return" } },
+    "close-display": { type: "button", overrides: { name: "Close Display", text: "Close" } },
+    "display-menu": { type: "frame", overrides: { name: "Display List Selector", w: 240, h: 300, fill: "#f8fafc", border: "#94a3b8", radius: 0 } },
+    "multistate-indicator": { type: "shape", overrides: { name: "Multistate Indicator", w: 90, h: 90, radius: 999, fill: "#22c55e", border: "#166534" } },
+    "symbol-indicator": { type: "shape", overrides: { name: "Symbol Indicator", w: 96, h: 96, radius: 10, fill: "#38bdf8", border: "#075985" } },
+    "list-indicator": { type: "card", overrides: { name: "List Indicator", text: "Status\nRunning\nReady", w: 220, h: 150 } },
+    "bar-graph": { type: "shape", overrides: { name: "Bar Graph", w: 220, h: 44, radius: 2, fill: "linear-gradient(90deg,#22c55e 62%,#e2e8f0 62%)", border: "#64748b" } },
+    gauge: { type: "shape", overrides: { name: "Gauge", w: 140, h: 90, radius: 90, fill: "#e0f2fe", border: "#0284c7" } },
+    scale: { type: "shape", overrides: { name: "Scale", w: 180, h: 12, radius: 0, fill: "repeating-linear-gradient(90deg,#334155 0 2px,transparent 2px 20px)", border: "transparent" } }
+  };
+  const preset = presets[id] ?? presets.text;
+  addElement(preset.type, { x, y }, preset.overrides);
 }
 
 function addPage(): void {
@@ -1840,13 +2436,15 @@ function addPage(): void {
     generatedId: generatedScreenId(app.model.pages.length),
     name: `Page ${app.model.pages.length + 1}`,
     slug: `page-${app.model.pages.length + 1}`,
-    width: 1200,
-    height: 800,
+    width: activePage()?.width ?? DEFAULT_CANVAS_WIDTH,
+    height: activePage()?.height ?? DEFAULT_CANVAS_HEIGHT,
     background: "#ffffff",
     elements: [makeElement("text", 80, 80, { text: `Page ${app.model.pages.length + 1}`, font: 42, w: 520, h: 88, z: 1 })]
   };
   app.model.pages.push(page);
   app.model.currentPageId = page.id;
+  app.model.panX = 0;
+  app.model.panY = 0;
   app.selectedIds = [];
   app.activePanel = "pages";
   markDirty(true);
@@ -1855,8 +2453,71 @@ function addPage(): void {
 function selectPage(id: string): void {
   if (!app.model?.pages.some((page) => page.id === id)) return;
   app.model.currentPageId = id;
+  app.model.panX = 0;
+  app.model.panY = 0;
   app.selectedIds = [];
-  render();
+  fitCanvas();
+}
+
+function addNavigationButton(targetId?: string): void {
+  const page = activePage();
+  if (!app.model || !page) return;
+  const target = app.model.pages.find((candidate) => candidate.id === targetId) ?? app.model.pages.find((candidate) => candidate.id !== page.id) ?? page;
+  addElement("button", { x: 40, y: 40 + page.elements.filter((element) => element.name.startsWith("Nav:")).length * 54 }, {
+    name: `Nav: ${target.name}`,
+    text: target.name,
+    action: "page",
+    target: target.id,
+    w: 210,
+    h: 42,
+    radius: 2,
+    fill: "#1f2937",
+    border: "#475569"
+  });
+}
+
+function addNavigationMenu(): void {
+  const page = activePage();
+  if (!app.model || !page) return;
+  pushHistory("add navigation menu");
+  const x = 24;
+  const y = 24;
+  const width = 250;
+  const rowHeight = 34;
+  const menuHeight = Math.min(page.height - 48, Math.max(120, app.model.pages.length * rowHeight + 54));
+  const group = makeElement("frame", x, y, {
+    name: "Display Navigation",
+    w: width,
+    h: menuHeight,
+    fill: "#f8fafc",
+    border: "#64748b",
+    borderWidth: 1,
+    radius: 0,
+    z: nextZ(page)
+  });
+  page.elements.push(group);
+  app.model.pages.forEach((target, index) => {
+    const button = makeElement("button", x + 12, y + 14 + index * rowHeight, {
+      name: `Nav: ${target.name}`,
+      text: `${String(index + 1).padStart(3, "0")} ${target.name}`,
+      action: "page",
+      target: target.id,
+      parentId: group.id,
+      w: width - 24,
+      h: 28,
+      radius: 0,
+      fill: target.id === page.id ? "#f59e0b" : "#1f2937",
+      color: target.id === page.id ? "#111827" : "#ffffff",
+      border: "#334155",
+      font: 12,
+      weight: 800,
+      z: nextZ(page) + index
+    });
+    page.elements.push(button);
+  });
+  app.selectedIds = [group.id];
+  app.utilityTab = "objects";
+  markDirty(true);
 }
 
 function selectElement(id: string, append = false): void {
@@ -1868,6 +2529,7 @@ function selectElement(id: string, append = false): void {
     app.selectedIds = [id];
   }
   app.rightCollapsed = false;
+  if (app.utilityTab !== "objects") app.utilityTab = "properties";
   render();
 }
 
@@ -2100,25 +2762,152 @@ function arrangeSelection(direction: "front" | "back"): void {
   markDirty(true);
 }
 
+function toggleObjectCollapsed(id: string): void {
+  if (!id) return;
+  if (app.collapsedObjectIds.has(id)) app.collapsedObjectIds.delete(id);
+  else app.collapsedObjectIds.add(id);
+  render();
+}
+
+function setObjectVisible(id: string, visible: boolean): void {
+  const element = activePage()?.elements.find((candidate) => candidate.id === id);
+  if (!element) return;
+  pushHistory("visibility");
+  element.hidden = !visible;
+  markDirty(true);
+}
+
+function toggleObjectLocked(id: string): void {
+  const element = activePage()?.elements.find((candidate) => candidate.id === id);
+  if (!element) return;
+  pushHistory("lock");
+  element.locked = !element.locked;
+  markDirty(true);
+}
+
+function collapseAllObjects(): void {
+  const page = activePage();
+  if (!page) return;
+  app.collapsedObjectIds = new Set(page.elements.filter((element) => page.elements.some((candidate) => candidate.parentId === element.id)).map((element) => element.id));
+  render();
+}
+
+function groupSelection(): void {
+  const page = activePage();
+  const selected = selectedElements().filter((element) => !element.locked);
+  if (!app.model || !page || selected.length < 2) {
+    toast("Select 2+ objects to group.");
+    return;
+  }
+  pushHistory("group");
+  const minX = Math.min(...selected.map((element) => element.x));
+  const minY = Math.min(...selected.map((element) => element.y));
+  const maxX = Math.max(...selected.map((element) => element.x + element.w));
+  const maxY = Math.max(...selected.map((element) => element.y + element.h));
+  const group = makeElement("frame", minX, minY, {
+    name: `Group${app.model.nextNumber}`,
+    w: maxX - minX,
+    h: maxY - minY,
+    fill: "transparent",
+    border: "#38bdf8",
+    borderWidth: 1,
+    radius: 0,
+    z: Math.max(1, Math.min(...selected.map((element) => element.z)) - 1)
+  });
+  const commonParent = selected.every((element) => element.parentId === selected[0].parentId) ? selected[0].parentId : undefined;
+  group.parentId = commonParent;
+  page.elements.push(group);
+  selected.forEach((element) => {
+    element.parentId = group.id;
+  });
+  app.selectedIds = [group.id];
+  app.utilityTab = "objects";
+  markDirty(true);
+}
+
+function ungroupSelection(): void {
+  const page = activePage();
+  const groups = selectedElements();
+  if (!page || !groups.length) return;
+  const groupIds = new Set(groups.map((element) => element.id));
+  if (!page.elements.some((element) => element.parentId && groupIds.has(element.parentId))) {
+    toast("Select a group that contains objects.");
+    return;
+  }
+  pushHistory("ungroup");
+  groups.forEach((group) => {
+    page.elements.forEach((element) => {
+      if (element.parentId === group.id) element.parentId = group.parentId;
+    });
+  });
+  page.elements = page.elements.filter((element) => !groupIds.has(element.id));
+  app.selectedIds = [];
+  markDirty(true);
+}
+
 function startWorkspacePointer(event: PointerEvent): void {
-  if (event.target !== event.currentTarget || app.activeTool !== "hand") return;
-  const workspace = event.currentTarget as HTMLElement;
+  if (app.activeTool !== "hand" || !(event.target instanceof HTMLElement) || !event.target.closest("#stage-viewport")) return;
+  startCameraPan(event);
+}
+
+function startCameraPan(event: PointerEvent): void {
+  if (!app.model) return;
+  event.preventDefault();
   app.drag = {
     kind: "pan",
     startClientX: event.clientX,
     startClientY: event.clientY,
     startCanvasX: 0,
     startCanvasY: 0,
-    startScrollX: workspace.scrollLeft,
-    startScrollY: workspace.scrollTop,
+    startPanX: app.model.panX,
+    startPanY: app.model.panY,
     originals: []
   };
   document.addEventListener("pointermove", onPointerMove);
   document.addEventListener("pointerup", onPointerUp, { once: true });
 }
 
+function startPanelResize(event: PointerEvent): void {
+  const side = (event.currentTarget as HTMLElement).dataset.resizePanel as PanelResizeState["side"];
+  if (!side) return;
+  event.preventDefault();
+  app.panelResize = {
+    side,
+    startClientX: event.clientX,
+    startWidth: side === "left" ? app.leftWidth : app.rightWidth
+  };
+  document.body.classList.add("is-resizing-panel");
+  document.addEventListener("pointermove", onPanelResizeMove);
+  document.addEventListener("pointerup", onPanelResizeUp, { once: true });
+}
+
+function onPanelResizeMove(event: PointerEvent): void {
+  if (!app.panelResize) return;
+  const delta = event.clientX - app.panelResize.startClientX;
+  if (app.panelResize.side === "left") app.leftWidth = clampNumber(app.panelResize.startWidth + delta, 220, 520);
+  else app.rightWidth = clampNumber(app.panelResize.startWidth - delta, 260, 560);
+  const shell = root.querySelector<HTMLElement>(".forge-app");
+  if (shell) {
+    shell.style.setProperty("--left-width", `${app.leftWidth}px`);
+    shell.style.setProperty("--right-width", `${app.rightWidth}px`);
+  }
+  clampCameraPan();
+  updateCameraOnly();
+}
+
+function onPanelResizeUp(): void {
+  app.panelResize = undefined;
+  document.body.classList.remove("is-resizing-panel");
+  document.removeEventListener("pointermove", onPanelResizeMove);
+  render();
+}
+
 function startCanvasPointer(event: PointerEvent): void {
   if (event.target !== event.currentTarget) return;
+  if (app.activeTool === "hand") {
+    startCameraPan(event);
+    return;
+  }
   const point = canvasPoint(event);
   if (!point) return;
   if (app.activeTool === "text") {
@@ -2137,6 +2926,10 @@ function startElementPointer(event: PointerEvent): void {
   const node = event.currentTarget as HTMLElement;
   const id = node.dataset.elementId ?? "";
   const element = activePage()?.elements.find((candidate) => candidate.id === id);
+  if (app.activeTool === "hand") {
+    startCameraPan(event);
+    return;
+  }
   if (!element || element.locked || app.activeTool !== "select") return;
   event.stopPropagation();
   if (!app.selectedIds.includes(id)) app.selectedIds = event.shiftKey ? [...app.selectedIds, id] : [id];
@@ -2189,13 +2982,44 @@ function canvasPoint(event: PointerEvent | MouseEvent): { x: number; y: number }
   return { x: (event.clientX - rect.left) / scale, y: (event.clientY - rect.top) / scale };
 }
 
+function clampCameraPan(): void {
+  const page = activePage();
+  const viewport = root.querySelector<HTMLElement>("#stage-viewport");
+  if (!app.model || !page || !viewport) return;
+  const scale = app.model.zoom / 100;
+  const overflowX = Math.max(0, (page.width * scale - viewport.clientWidth) / 2);
+  const overflowY = Math.max(0, (page.height * scale - viewport.clientHeight) / 2);
+  const margin = 120;
+  app.model.panX = clampNumber(app.model.panX, -(overflowX + margin), overflowX + margin);
+  app.model.panY = clampNumber(app.model.panY, -(overflowY + margin), overflowY + margin);
+  if (overflowX === 0) app.model.panX = 0;
+  if (overflowY === 0) app.model.panY = 0;
+}
+
+function updateCameraOnly(): void {
+  const camera = root.querySelector<HTMLElement>("#stage-camera");
+  if (!camera || !app.model) return;
+  camera.style.transform = `translate(${app.model.panX}px, ${app.model.panY}px) scale(${app.model.zoom / 100})`;
+  root.querySelectorAll<HTMLElement>(".zoom-readout").forEach((node) => {
+    node.textContent = `${app.model?.zoom ?? 100}%`;
+  });
+}
+
+function onViewportWheel(event: WheelEvent): void {
+  if (!app.model || !event.ctrlKey) return;
+  event.preventDefault();
+  const step = event.deltaY > 0 ? -10 : 10;
+  setZoom(app.model.zoom + step);
+}
+
 function onPointerMove(event: PointerEvent): void {
   if (!app.drag) return;
   if (app.drag.kind === "pan") {
-    const workspace = root.querySelector<HTMLElement>("#workspace");
-    if (!workspace) return;
-    workspace.scrollLeft = (app.drag.startScrollX ?? 0) - (event.clientX - app.drag.startClientX);
-    workspace.scrollTop = (app.drag.startScrollY ?? 0) - (event.clientY - app.drag.startClientY);
+    if (!app.model) return;
+    app.model.panX = (app.drag.startPanX ?? 0) + (event.clientX - app.drag.startClientX);
+    app.model.panY = (app.drag.startPanY ?? 0) + (event.clientY - app.drag.startClientY);
+    clampCameraPan();
+    updateCameraOnly();
     return;
   }
   const point = canvasPoint(event);
@@ -2249,9 +3073,11 @@ function onPointerMove(event: PointerEvent): void {
 
 function onPointerUp(): void {
   if (!app.drag) return;
+  const kind = app.drag.kind;
   app.drag = undefined;
   document.removeEventListener("pointermove", onPointerMove);
-  markDirty(true);
+  if (kind === "pan") render();
+  else markDirty(true);
 }
 
 function updateCanvasElementsOnly(): void {
@@ -2286,17 +3112,20 @@ function redo(): void {
 
 function setZoom(value: number): void {
   if (!app.model) return;
-  app.model.zoom = Math.min(200, Math.max(25, value));
+  app.model.zoom = Math.min(400, Math.max(10, Math.round(value)));
+  clampCameraPan();
   render();
 }
 
 function fitCanvas(): void {
   const page = activePage();
-  const workspace = root.querySelector<HTMLElement>("#workspace");
-  if (!app.model || !page || !workspace) return;
-  const availableW = workspace.clientWidth - 96;
-  const availableH = workspace.clientHeight - 96;
-  app.model.zoom = Math.max(25, Math.min(160, Math.floor(Math.min(availableW / page.width, availableH / page.height) * 100)));
+  const viewport = root.querySelector<HTMLElement>("#stage-viewport");
+  if (!app.model || !page || !viewport) return;
+  const availableW = Math.max(1, viewport.clientWidth - 40);
+  const availableH = Math.max(1, viewport.clientHeight - 40);
+  app.model.zoom = Math.max(10, Math.min(200, Math.floor(Math.min(availableW / page.width, availableH / page.height) * 100)));
+  app.model.panX = 0;
+  app.model.panY = 0;
   render();
 }
 
@@ -2314,7 +3143,7 @@ async function createNew(): Promise<void> {
   app.model = await modelFromProject(project);
   app.model.pages[0].elements = [
     makeElement("text", 86, 82, { text: "New interface", font: 48, w: 640, h: 92, z: 1 }),
-    makeElement("card", 86, 190, { text: "Start from here\nAdd UI pieces from the Build panel, then save anything reusable.", w: 420, h: 180, z: 2 })
+    makeElement("card", 86, 190, { text: "Start from here\nAdd UI pieces from the Toolbox, then save anything reusable.", w: 420, h: 180, z: 2 })
   ];
   syncProjectModel();
   await putProject(project);
