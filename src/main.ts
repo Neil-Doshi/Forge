@@ -551,7 +551,7 @@ function clampNumber(value: number, min: number, max: number): number {
 }
 
 function largestCssDimension(source: string, properties: string[], min: number, max: number): number | undefined {
-  const pattern = new RegExp(`(?:${properties.join("|")})\\s*:\\s*(\\d+(?:\\.\\d+)?)px`, "gi");
+  const pattern = new RegExp(`(?:^|[;{\\s])(?:${properties.join("|")})\\s*:\\s*(\\d+(?:\\.\\d+)?)px`, "gi");
   const values = Array.from(source.matchAll(pattern))
     .map((match) => Number(match[1]))
     .filter((value) => Number.isFinite(value) && value >= min && value <= max);
@@ -559,11 +559,11 @@ function largestCssDimension(source: string, properties: string[], min: number, 
 }
 
 function inferImportedViewport(screen: ImportedScreen): ImportViewport {
-  const source = `${screen.html}\n${screen.css}`;
-  const explicitWidth = largestCssDimension(source, ["width", "min-width"], MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH);
-  const explicitHeight = largestCssDimension(source, ["height", "min-height"], MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT);
-  const viewportWidth = clampNumber(Math.round(window.innerWidth || DEFAULT_CANVAS_WIDTH), DEFAULT_CANVAS_WIDTH, 1920);
-  const viewportHeight = clampNumber(Math.round(window.innerHeight || DEFAULT_CANVAS_HEIGHT), DEFAULT_CANVAS_HEIGHT, 1080);
+  const inlineShell = screen.html.match(/<(?:main|div|section)[^>]+(?:id=["'](?:app|shell|main|root)["']|class=["'][^"']*(?:app|shell|screen|display)[^"']*["'])[^>]+style=["']([^"']+)["']/i)?.[1] ?? "";
+  const explicitWidth = largestCssDimension(inlineShell, ["width"], MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH);
+  const explicitHeight = largestCssDimension(inlineShell, ["height"], MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT);
+  const viewportWidth = clampNumber(Math.round(window.innerWidth || DEFAULT_CANVAS_WIDTH), MIN_IMPORT_WIDTH, 1920);
+  const viewportHeight = clampNumber(Math.round(window.innerHeight || DEFAULT_CANVAS_HEIGHT), MIN_IMPORT_HEIGHT, 1080);
   return {
     width: explicitWidth ?? viewportWidth,
     height: explicitHeight ?? viewportHeight
@@ -662,23 +662,6 @@ function importElementImportance(type: ElementType | undefined, node: HTMLElemen
   return 1;
 }
 
-function measuredContentBounds(doc: Document, viewport: ImportViewport): ImportViewport {
-  let right = Math.max(doc.documentElement.scrollWidth, doc.body.scrollWidth, viewport.width);
-  let bottom = Math.max(doc.documentElement.scrollHeight, doc.body.scrollHeight, viewport.height);
-  Array.from(doc.body.querySelectorAll<HTMLElement>("*")).forEach((node) => {
-    const style = doc.defaultView!.getComputedStyle(node);
-    if (style.display === "none" || style.visibility === "hidden") return;
-    const rect = node.getBoundingClientRect();
-    if (rect.width < 1 || rect.height < 1) return;
-    right = Math.max(right, Math.ceil(rect.right));
-    bottom = Math.max(bottom, Math.ceil(rect.bottom));
-  });
-  return {
-    width: clampNumber(right, MIN_IMPORT_WIDTH, MAX_IMPORT_WIDTH),
-    height: clampNumber(bottom, MIN_IMPORT_HEIGHT, MAX_IMPORT_HEIGHT)
-  };
-}
-
 function nodeSourcePath(node: HTMLElement): string {
   const parts: string[] = [];
   let current: HTMLElement | null = node;
@@ -707,14 +690,6 @@ async function measuredElementsFromImportedScreen(screen: ImportedScreen): Promi
   }
   await doc.fonts?.ready.catch(() => undefined);
   await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-
-  const bounds = measuredContentBounds(doc, viewport);
-  if (bounds.width > viewport.width || bounds.height > viewport.height) {
-    viewport = bounds;
-    frame.style.width = `${viewport.width}px`;
-    frame.style.height = `${viewport.height}px`;
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-  }
 
   const selector = [
     "#topbar",
@@ -849,7 +824,8 @@ function shouldRepairStoredImport(project: HtmlForgeProject, model: ForgeDesignM
   const names = model.pages.slice(0, 10).map((page) => page.name.toLowerCase());
   const layoutPages = names.filter((name) => ["topbar", "topnav", "shell", "sidebar", "main"].includes(name) || name === "div").length;
   const preservedPages = model.pages.filter((page) => page.elements.length === 1 && page.elements[0]?.type === "html").length;
-  return layoutPages >= 3 || (model.pages.length > 2 && preservedPages >= Math.min(3, model.pages.length));
+  const inflatedResponsiveImport = model.pages.some((page) => page.width === 1320 || page.height >= 1800);
+  return inflatedResponsiveImport || layoutPages >= 3 || (model.pages.length > 2 && preservedPages >= Math.min(3, model.pages.length));
 }
 
 async function modelFromProject(project: HtmlForgeProject): Promise<ForgeDesignModel> {
@@ -937,14 +913,13 @@ async function modelFromImport(result: ImportAnalysisResult): Promise<ForgeDesig
     })
   );
   const templates = importedTemplates(report.sanitizedHtml);
-  const measuredScreenImport = pages.some((page) => page.elements.length > 24);
   const model: ForgeDesignModel = {
     version: 2,
     theme: "forge",
     currentPageId: pages[0].id,
     pages,
     templates,
-    zoom: measuredScreenImport ? 75 : 100,
+    zoom: 100,
     panX: 0,
     panY: 0,
     grid: true,
@@ -1240,6 +1215,11 @@ function render(): void {
   bindEvents();
 }
 
+function renderThenFit(): void {
+  render();
+  window.requestAnimationFrame(() => fitCanvas());
+}
+
 function topbarMarkup(): string {
   const page = activePage();
   return `
@@ -1402,7 +1382,7 @@ function templatePreviewMarkup(elements: ForgeElement[]): string {
   const maxY = Math.max(...items.map((element) => element.y + element.h));
   const width = Math.max(40, maxX - minX);
   const height = Math.max(28, maxY - minY);
-  const scale = Math.min(1, 190 / width, 82 / height);
+  const scale = Math.min(1, 68 / width, 38 / height);
   return `
     <span class="reuse-preview" aria-hidden="true">
       <span class="reuse-preview-stage" style="width:${width}px;height:${height}px;transform:scale(${scale});">
@@ -2987,13 +2967,10 @@ function clampCameraPan(): void {
   const viewport = root.querySelector<HTMLElement>("#stage-viewport");
   if (!app.model || !page || !viewport) return;
   const scale = app.model.zoom / 100;
-  const overflowX = Math.max(0, (page.width * scale - viewport.clientWidth) / 2);
-  const overflowY = Math.max(0, (page.height * scale - viewport.clientHeight) / 2);
-  const margin = 120;
-  app.model.panX = clampNumber(app.model.panX, -(overflowX + margin), overflowX + margin);
-  app.model.panY = clampNumber(app.model.panY, -(overflowY + margin), overflowY + margin);
-  if (overflowX === 0) app.model.panX = 0;
-  if (overflowY === 0) app.model.panY = 0;
+  const overflowX = Math.max(0, page.width * scale - viewport.clientWidth);
+  const overflowY = Math.max(0, page.height * scale - viewport.clientHeight);
+  app.model.panX = overflowX ? clampNumber(app.model.panX, -overflowX, 0) : 0;
+  app.model.panY = overflowY ? clampNumber(app.model.panY, -overflowY, 0) : 0;
 }
 
 function updateCameraOnly(): void {
@@ -3121,8 +3098,8 @@ function fitCanvas(): void {
   const page = activePage();
   const viewport = root.querySelector<HTMLElement>("#stage-viewport");
   if (!app.model || !page || !viewport) return;
-  const availableW = Math.max(1, viewport.clientWidth - 40);
-  const availableH = Math.max(1, viewport.clientHeight - 40);
+  const availableW = Math.max(1, viewport.clientWidth);
+  const availableH = Math.max(1, viewport.clientHeight);
   app.model.zoom = Math.max(10, Math.min(200, Math.floor(Math.min(availableW / page.width, availableH / page.height) * 100)));
   app.model.panX = 0;
   app.model.panY = 0;
@@ -3151,7 +3128,7 @@ async function createNew(): Promise<void> {
   app.history = [];
   app.redo = [];
   app.selectedIds = [];
-  render();
+  renderThenFit();
 }
 
 async function openProject(id: string): Promise<void> {
@@ -3171,7 +3148,7 @@ async function openProject(id: string): Promise<void> {
   app.selectedIds = [];
   app.history = [];
   app.redo = [];
-  render();
+  renderThenFit();
 }
 
 async function importHtmlFile(file?: File): Promise<void> {
@@ -3224,7 +3201,7 @@ async function acceptImport(): Promise<void> {
   app.selectedIds = [];
   app.history = [];
   app.redo = [];
-  render();
+  renderThenFit();
   toast("Imported into editable canvas.");
 }
 

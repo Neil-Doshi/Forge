@@ -419,6 +419,43 @@ textarea {
   scrollbar-width: thin;
 }
 
+.left-panel .panel-body {
+  padding: 6px;
+  color: #111827;
+  background: #f8fafc;
+}
+
+.left-panel .panel-section {
+  margin-bottom: 6px;
+  padding: 6px;
+  color: #111827;
+  background: #f8fafc;
+  border-color: #cbd5e1;
+  border-radius: 0;
+}
+
+.left-panel .panel-section h2,
+.left-panel .field-label,
+.left-panel .check-row {
+  color: #111827;
+}
+
+.left-panel .muted,
+.left-panel small {
+  color: #475569;
+}
+
+.left-panel input,
+.left-panel select,
+.left-panel textarea {
+  min-height: 24px;
+  padding: 3px 6px;
+  color: #111827;
+  background: #ffffff;
+  border-color: #cbd5e1;
+  border-radius: 0;
+}
+
 .right-panel .inspector-body {
   height: calc(100% - 48px);
 }
@@ -536,6 +573,31 @@ body.is-resizing-panel {
 .template-row {
   grid-template-columns: 98px minmax(0, 1fr);
   align-items: stretch;
+}
+
+.left-panel .template-row,
+.left-panel .asset-row,
+.left-panel .theme-card,
+.left-panel .component-tile {
+  min-height: 46px;
+  padding: 4px;
+  color: #111827;
+  background: #ffffff;
+  border-color: #cbd5e1;
+  border-radius: 0;
+}
+
+.left-panel .template-row {
+  grid-template-columns: 76px minmax(0, 1fr);
+  gap: 6px;
+}
+
+.left-panel .template-row:hover,
+.left-panel .asset-row:hover,
+.left-panel .theme-card:hover,
+.left-panel .component-tile:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
 }
 
 .asset-row {
@@ -722,6 +784,13 @@ body.is-resizing-panel {
   background: #ffffff;
 }
 
+.left-panel .reuse-preview {
+  width: 72px;
+  min-height: 42px;
+  border-color: #cbd5e1;
+  border-radius: 0;
+}
+
 .reuse-preview-stage {
   position: absolute;
   top: 5px;
@@ -858,8 +927,7 @@ body.is-resizing-panel {
 .stage-viewport {
   position: absolute;
   inset: 0 0 48px;
-  display: grid;
-  place-items: center;
+  display: block;
   overflow: hidden;
   background:
     linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
@@ -869,9 +937,11 @@ body.is-resizing-panel {
 }
 
 .stage-camera {
-  position: relative;
+  position: absolute;
+  top: 0;
+  left: 0;
   flex: 0 0 auto;
-  transform-origin: center center;
+  transform-origin: top left;
   will-change: transform;
 }
 
@@ -881,7 +951,7 @@ body.is-resizing-panel {
   border: 1px solid color-mix(in srgb, var(--line) 72%, white);
   border-radius: 2px;
   box-shadow: 0 32px 90px rgba(0, 0, 0, 0.45);
-  transform-origin: center center;
+  transform-origin: top left;
 }
 
 .design-canvas.show-grid {
