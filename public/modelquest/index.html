@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="ModelQuest: learn machine learning by building 13 working models from regression to RAG.">
+<meta name="theme-color" content="#07111f">
+<title>ModelQuest — Learn ML by Building</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top"><div class="topin">
+  <div class="brand"><div class="logo">MQ</div><span>ModelQuest</span><span style="color:var(--muted);font-size:.76rem">learn ML by building</span></div>
+  <button class="search" id="searchOpen">Search concepts, errors, tools… <span>Ctrl K</span></button>
+  <button class="btn" id="resume">▶ Resume</button>
+  <button class="btn" id="exportBtn" title="Download a tiny progress backup">Backup</button>
+  <button class="btn" id="importBtn" title="Restore a progress backup">Restore</button>
+  <input id="importFile" type="file" accept="application/json" hidden>
+  <button class="btn" id="theme" aria-label="Toggle light or dark theme">◐</button>
+</div></header>
+<div class="layout">
+  <aside class="side" id="side"></aside>
+  <main class="main">
+    <div class="mobile" id="mobile"></div>
+    <section class="hero" id="homeHero">
+      <div class="eyebrow">13 WORKING MODELS · FREE-FIRST · BUILT FOR CURIOSITY</div>
+      <h1>Build AI. Break it. Fix it. Understand it.</h1>
+      <p>A practical machine-learning journey from the first prediction to a personal AI system. Short missions, live experiments, copy-ready Colab code, real mistakes, official documentation, research and the tiny details most tutorials skip.</p>
+      <div class="actions"><button class="btn primary" id="continue">▶ Continue where I left off</button><button class="btn" id="start">Start at Model 1</button></div>
+      <div class="progress"><div class="bar"><i id="gbar"></i></div><b id="gpct">0%</b></div>
+    </section>
+    <div id="view"></div>
+  </main>
+</div>
+<div class="modalback" id="searchModal"><div class="modal"><div class="mhead"><h2>Search ModelQuest</h2><button class="x" id="closeSearch">×</button></div><div class="mbody"><input class="searchin" id="searchInput" placeholder="Try: why accuracy high but model bad"><div id="results"></div></div></div></div>
+<div class="modalback" id="stuckModal"><div class="modal"><div class="mhead"><h2>I’m stuck</h2><button class="x" id="closeStuck">×</button></div><div class="mbody"><p style="color:var(--muted)">Choose what is blocking you. The goal is to diagnose the problem, not guess.</p><div class="stuckopts" id="stuckOpts"></div><div id="stuckAnswer"></div></div></div></div>
+<div class="toast" id="toast">Copied</div>
+<script src="data.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
