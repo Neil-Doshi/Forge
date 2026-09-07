@@ -3,18 +3,19 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="ModelQuest: learn machine learning by building 13 working models from regression to RAG.">
-<meta name="theme-color" content="#f6f8fc">
-<title>ModelQuest — Learn ML by Building</title>
+<meta name="description" content="ModelQuest: a game-like mechanical-engineering machine-learning world with 13 interactive real-world model quests.">
+<meta name="theme-color" content="#030303">
+<title>ModelQuest — Interactive ML World</title>
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="upgrade.css">
 <link rel="stylesheet" href="theory.css">
 <link rel="stylesheet" href="experience.css">
 <link rel="stylesheet" href="studio-v4.css">
+<link rel="stylesheet" href="world-v5.css">
 </head>
 <body>
 <header class="top"><div class="topin">
-  <div class="brand"><div class="logo">MQ</div><span>ModelQuest</span><span style="color:var(--muted);font-size:.76rem">learn ML by building</span></div>
+  <div class="brand"><div class="logo">MQ</div><span>ModelQuest</span><span style="color:var(--muted);font-size:.76rem">interactive ML world</span></div>
   <button class="search" id="searchOpen">Search concepts, errors, tools… <span>Ctrl K</span></button>
   <button class="btn" id="resume">▶ Resume</button>
   <button class="btn" id="exportBtn" title="Download a tiny progress backup">Backup</button>
@@ -29,7 +30,7 @@
     <section class="hero" id="homeHero">
       <div class="eyebrow">13 WORKING MODELS · FREE-FIRST · BUILT FOR CURIOSITY</div>
       <h1>Build AI. Break it. Fix it. Understand it.</h1>
-      <p>A guided machine-learning journey from the first prediction to a personal AI system.</p>
+      <p>A guided machine-learning journey from sensor calibration to an engineering copilot.</p>
     </section>
     <div id="view"></div>
   </main>
@@ -42,5 +43,7 @@
 <script src="guide.js"></script>
 <script src="theory.js"></script>
 <script src="studio-v4.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/animejs@3.2.2/lib/anime.min.js"></script>
+<script src="world-v5.js"></script>
 </body>
 </html>
